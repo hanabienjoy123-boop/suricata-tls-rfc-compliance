@@ -318,6 +318,7 @@ noinst_HEADERS = \
 	detect-tls-ja3s-hash.h \
 	detect-tls-ja3s-string.h \
 	detect-tls-random.h \
+	detect-tls-random-reused.h \
 	detect-tls-sni.h \
 	detect-tls-subjectaltname.h \
 	detect-tls-version.h \
@@ -919,6 +920,7 @@ libsuricata_c_a_SOURCES = \
 	detect-tls-ja3s-hash.c \
 	detect-tls-ja3s-string.c \
 	detect-tls-random.c \
+	detect-tls-random-reused.c \
 	detect-tls-sni.c \
 	detect-tls-subjectaltname.c \
 	detect-tls-version.c \

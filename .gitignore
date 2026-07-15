@@ -65,3 +65,5 @@ doc/userguide/*.1
 
 # Don't ignore *.rules in rules/
 !/rules/*.rules
+*:Zone.Identifier
+*:Zone.Identifier

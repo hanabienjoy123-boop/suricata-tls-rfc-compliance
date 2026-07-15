@@ -58,6 +58,7 @@
 #include "detect-tls-alpn.h"
 #include "detect-tls-subjectaltname.h"
 #include "detect-tls-random.h"
+#include "detect-tls-random-reused.h"
 #include "detect-tls-ja3-hash.h"
 #include "detect-tls-ja3-string.h"
 #include "detect-tls-ja3s-hash.h"
@@ -596,7 +597,8 @@ void SigTableSetup(void)
     DetectTlsCertChainLenRegister();
     DetectTlsSubjectAltNameRegister();
     DetectTlsAlpnRegister();
-    DetectTlsRandomRegister();
+    DetectTlsRandomRegister();  
+    DetectTlsRandomReusedRegister();
 
     DetectTlsJa3HashRegister();
     DetectTlsJa3StringRegister();
