@@ -18,10 +18,10 @@
 /**
  * \file
  *
- * Implements support for tls.random_reused keyword.
+ * Implements the tls.random_reused keyword.
  *
- * Matches when the TLS client random and server random are identical,
- * which should never happen in a legitimate handshake.
+ * Matches when the TLS client_random equals the server_random, which does
+ * not occur in a legitimate handshake.
  */
 
 #include "suricata-common.h"
@@ -39,13 +39,12 @@
 
 #include "detect-tls-random-reused.h"
 
-static int DetectTlsRandomReusedSetup(DetectEngineCtx *, Signature *, const char *);
 static int DetectTlsRandomReusedMatch(DetectEngineThreadCtx *, Flow *,
         uint8_t, void *, void *, const Signature *, const SigMatchCtx *);
+static int DetectTlsRandomReusedSetup(DetectEngineCtx *, Signature *, const char *);
 
-/**
- * \brief Registration function for keyword: tls.random_reused
- */
+static int g_tls_generic_list_id = 0;
+
 void DetectTlsRandomReusedRegister(void)
 {
     sigmatch_table[DETECT_TLS_RANDOM_REUSED].name = "tls.random_reused";
@@ -55,50 +54,36 @@ void DetectTlsRandomReusedRegister(void)
             "/rules/tls-keywords.html#tls-random-reused";
     sigmatch_table[DETECT_TLS_RANDOM_REUSED].AppLayerTxMatch = DetectTlsRandomReusedMatch;
     sigmatch_table[DETECT_TLS_RANDOM_REUSED].Setup = DetectTlsRandomReusedSetup;
-    sigmatch_table[DETECT_TLS_RANDOM_REUSED].flags |= SIGMATCH_NOOPT;
+    sigmatch_table[DETECT_TLS_RANDOM_REUSED].flags = SIGMATCH_NOOPT;
 
-    /* Both randoms are only available once the ServerHello has been seen,
-     * so we only inspect in the toclient direction. */
-    DetectAppLayerInspectEngineRegister("tls.random_reused", ALPROTO_TLS,
-            SIG_FLAG_TOCLIENT, TLS_STATE_SERVER_HELLO,
-            DetectEngineInspectGenericList, NULL);
+    g_tls_generic_list_id = DetectBufferTypeRegister("tls_generic");
+
+    DetectAppLayerInspectEngineRegister("tls_generic", ALPROTO_TLS,
+            SIG_FLAG_TOCLIENT, 0, DetectEngineInspectGenericList, NULL);
 }
 
-/**
- * \brief setup function for the tls.random_reused keyword
- *
- * \param de_ctx  detection engine context
- * \param s       signature the keyword belongs to
- * \param str     should be empty (SIGMATCH_NOOPT)
- *
- * \retval 0  on success
- * \retval -1 on failure
- */
 static int DetectTlsRandomReusedSetup(DetectEngineCtx *de_ctx, Signature *s, const char *str)
 {
-    if (SCDetectSignatureSetAppProto(s, ALPROTO_TLS) < 0)
+    if (SCDetectSignatureSetAppProto(s, ALPROTO_TLS) != 0)
         return -1;
 
     if (SCSigMatchAppendSMToList(de_ctx, s, DETECT_TLS_RANDOM_REUSED,
-                NULL, DETECT_SM_LIST_MATCH) == NULL) {
+                NULL, g_tls_generic_list_id) == NULL) {
         return -1;
     }
 
     return 0;
 }
 
-/**
- * \brief match function: returns 1 when client and server random are equal
- */
 static int DetectTlsRandomReusedMatch(DetectEngineThreadCtx *det_ctx, Flow *f,
         uint8_t flags, void *state, void *txv,
-        const Signature *s, const SigMatchCtx *m)
+        const Signature *s, const SigMatchCtx *ctx)
 {
     const SSLState *ssl_state = (const SSLState *)state;
     if (ssl_state == NULL)
         return 0;
 
-    /* Only compare once both randoms have actually been parsed. */
+    /* both randoms must be parsed before comparing */
     if ((ssl_state->flags & (TLS_TS_RANDOM_SET | TLS_TC_RANDOM_SET)) !=
             (TLS_TS_RANDOM_SET | TLS_TC_RANDOM_SET)) {
         return 0;
