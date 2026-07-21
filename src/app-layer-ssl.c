@@ -44,6 +44,8 @@
 #include "util-enum.h"
 #include "util-validate.h"
 
+#include "app-layer-ssl-rfc.h"
+
 static SCEnumCharMap tls_state_client_table[] = {
     {
             "client_in_progress",
@@ -163,6 +165,15 @@ SCEnumCharMap tls_decoder_event_table[] = {
     { "ERROR_MESSAGE_ENCOUNTERED", TLS_DECODER_EVENT_ERROR_MSG_ENCOUNTERED },
     /* used as a generic error event */
     { "INVALID_SSL_RECORD", TLS_DECODER_EVENT_INVALID_SSL_RECORD },
+        { "ERROR_MESSAGE_ENCOUNTERED", TLS_DECODER_EVENT_ERROR_MSG_ENCOUNTERED },
+    /* used as a generic error event */
+    { "INVALID_SSL_RECORD", TLS_DECODER_EVENT_INVALID_SSL_RECORD },
+    /* RFC conformance checks on extension type lists */
+    { "DUPLICATE_EXTENSIONS", TLS_DECODER_EVENT_DUPLICATE_EXTENSIONS },
+    { "SERVER_NEGOTIATED_GREASE_EXTENSION", TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_EXTENSION },
+    { "UNPROPOSED_EXTENSION", TLS_DECODER_EVENT_UNPROPOSED_EXTENSION },
+    { "SERVER_INVALID_SIGNATURE_ALGORITHMS", TLS_DECODER_EVENT_SERVER_INVALID_SIGNATURE_ALGORITHMS },
+    { "PSK_NOT_LAST_EXTENSION", TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION },
     { NULL, -1 },
 };
 
@@ -387,6 +398,42 @@ static AppLayerStateData *SSLGetStateData(void *vstate)
 {
     SSLState *ssl_state = (SSLState *)vstate;
     return &ssl_state->state_data;
+}
+
+/** \internal
+ *  \brief Run RFC conformance checks on the audited Hello extension type
+ *         lists and raise the corresponding decoder events on violation.
+ *
+ *  Must be called only after both sides' extension audits are populated,
+ *  i.e. once ext_audit.ready is set for the relevant side(s). The
+ *  individual TLSExtAudit* check functions are pure and self-guard
+ *  against unreliable (not ready / framing not ok / truncated) audit
+ *  data, so it is safe to call this unconditionally once available.
+ */
+static void TLSExtAuditRunChecks(SSLState *ssl_state)
+{
+    const SslExtAudit *c = &ssl_state->client_connp.ext_audit;
+    const SslExtAudit *s = &ssl_state->server_connp.ext_audit;
+
+    if (!TLSExtAuditNoDuplicateExtTypes(c)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_DUPLICATE_EXTENSIONS);
+    }
+    
+    if (!TLSExtAuditServerExtsSubsetOfClient(c, s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_UNPROPOSED_EXTENSION);
+    }
+
+    if (!TLSExtAuditServerNoGreaseNegotiated(s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_EXTENSION);
+    }
+
+    if (!TLSExtAuditServerNoSignatureAlgorithms(s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_INVALID_SIGNATURE_ALGORITHMS);
+    }
+
+    if (!TLSExtAuditPreSharedKeyIsLast(c)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION);
+    }
 }
 
 static void TlsDecodeHSCertificateErrSetEvent(SSLState *ssl_state, uint32_t err)
@@ -1252,8 +1299,20 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
                                          const uint8_t * const initial_input,
                                          const uint32_t input_len)
 {
-    const uint8_t *input = initial_input;
+    TLSExtractHSHelloExtTypes(initial_input, input_len, &ssl_state->curr_connp->ext_audit);
+    SCLogDebug("Audit status: ready=%u framing_ok=%u truncated=%u count=%u",
+        ssl_state->curr_connp->ext_audit.ready,
+        ssl_state->curr_connp->ext_audit.framing_ok,
+        ssl_state->curr_connp->ext_audit.truncated,
+        ssl_state->curr_connp->ext_audit.count);
+    
+    for (uint16_t i = 0; i < ssl_state->curr_connp->ext_audit.count; i++) {
+        SCLogDebug("  ext[%u]=0x%04x (%u)", i,
+        ssl_state->curr_connp->ext_audit.types[i],
+        ssl_state->curr_connp->ext_audit.types[i]);
+    }
 
+    const uint8_t *input = initial_input;
     int ret;
     int rc;
     // if ja3_hash is already computed, do not use new hello to augment ja3_str
@@ -1539,6 +1598,7 @@ static int TLSDecodeHandshakeHello(SSLState *ssl_state,
         UpdateClientState(ssl_state, TLS_STATE_CLIENT_HELLO_DONE);
     } else {
         UpdateServerState(ssl_state, TLS_STATE_SERVER_HELLO);
+        TLSExtAuditRunChecks(ssl_state);
     }
 end:
     return 0;

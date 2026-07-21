@@ -47,6 +47,7 @@ noinst_HEADERS = \
 	app-layer-smtp.h \
 	app-layer-ssh.h \
 	app-layer-ssl.h \
+	app-layer-ssl-rfc.h \
 	app-layer-tftp.h \
 	app-layer.h \
 	bindgen.h \
@@ -652,6 +653,7 @@ libsuricata_c_a_SOURCES = \
 	app-layer-smtp.c \
 	app-layer-ssh.c \
 	app-layer-ssl.c \
+	app-layer-ssl-rfc.c \
 	app-layer-tftp.c \
 	app-layer.c \
 	conf-yaml-loader.c \

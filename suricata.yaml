@@ -2325,11 +2325,10 @@ napatech:
 ## Configure Suricata to load Suricata-Update managed rules.
 ##
 
-default-rule-path: /home/masaka/suricata-tls-rfc-compliance/custom-detection/rules/
+default-rule-path: /home/masaka/suricata-tls-rfc-compliance/custom-detection/rules
 
 rule-files:
   - tls-rfc-compliance.rules
-
 ##
 ## Auxiliary configuration files.
 ##

@@ -28,6 +28,7 @@
 
 #include "util-ja3.h"
 #include "rust.h"
+#include "app-layer-ssl-rfc.h"
 
 enum TlsFrameTypes {
     TLS_FRAME_PDU = 0, /**< whole PDU, so header + data */
@@ -72,6 +73,12 @@ enum {
     TLS_DECODER_EVENT_CERTIFICATE_INVALID_VALIDITY,
     TLS_DECODER_EVENT_ERROR_MSG_ENCOUNTERED,
     TLS_DECODER_EVENT_INVALID_SSL_RECORD,
+    /* RFC conformance checks on extension type lists */
+    TLS_DECODER_EVENT_DUPLICATE_EXTENSIONS,
+    TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_EXTENSION,
+    TLS_DECODER_EVENT_UNPROPOSED_EXTENSION,
+    TLS_DECODER_EVENT_SERVER_INVALID_SIGNATURE_ALGORITHMS,
+    TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION,
 };
 
 enum TlsStateClient {
@@ -218,7 +225,7 @@ typedef struct SSLStateConnp_ {
     char *ja3_hash;
 
     HandshakeParams *hs;
-
+    SslExtAudit ext_audit;
     /* handshake tls fragmentation buffer. Handshake messages can be fragmented over multiple
      * TLS records. */
     uint8_t *hs_buffer;
