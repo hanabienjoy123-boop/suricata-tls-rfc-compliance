@@ -32,17 +32,15 @@
 void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *out)
 {
     memset(out, 0, sizeof(*out));
-      
+
     uint32_t offset = 0;
 
-    /* An absent extensions block is legal (e.g., ClientHello with no extensions). */
     if (len == 0) {
         out->framing_ok = true;
         out->ready = true;
         return;
     }
 
-    /* Need at least 2 bytes for extensions_length header. */
     if (len - offset < 2) {
         out->framing_ok = false;
         out->ready = true;
@@ -52,7 +50,6 @@ void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *ou
     uint16_t ext_total = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);
     offset += 2;
 
-    /* Declared extensions length must fit within the given buffer. */
     if (len - offset < ext_total) {
         out->framing_ok = false;
         out->ready = true;
@@ -61,38 +58,69 @@ void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *ou
 
     const uint32_t block_end = offset + ext_total;
 
-    while (offset < block_end) {
-        /* Each extension requires a 4-byte header: type(2) + length(2). */
-        if (block_end - offset < 4) {
+    /* Pass 1: validate framing and count extensions. No writes yet. */
+    uint32_t scan_offset = offset;
+    uint16_t ext_count = 0;
+    while (scan_offset < block_end) {
+        if (block_end - scan_offset < 4) {
             out->framing_ok = false;
             out->ready = true;
             return;
         }
+        uint16_t elen = (uint16_t)((buf[scan_offset + 2] << 8) | buf[scan_offset + 3]);
+        scan_offset += 4;
 
-        uint16_t etype = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);
-        uint16_t elen = (uint16_t)((buf[offset + 2] << 8) | buf[offset + 3]);
-        offset += 4;
-
-        /* Extension payload must fit within the declared extensions block. */
-        if (block_end - offset < elen) {
+        if (block_end - scan_offset < elen) {
             out->framing_ok = false;
             out->ready = true;
             return;
         }
-        
-        /* Extract all extension types (including GREASE and duplicates). */
-        if (out->count < SSL_EXT_AUDIT_MAX) {
-            out->types[out->count++] = etype;
-        } else {
-            out->truncated = true;
-        }
-
-        offset += elen;
+        scan_offset += elen;
+        ext_count++;
     }
 
-    /* Verify exact framing alignment: the parser must land precisely on block_end. */
-    out->framing_ok = (offset == block_end);
+    if (scan_offset != block_end) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    /* Framing is fully validated. Allocate exact-size storage. */
+    if (ext_count > 0) {
+        out->types = SCMalloc(ext_count * sizeof(uint16_t));
+        if (out->types == NULL) {
+            out->alloc_failed = true; /* OOM: treat as unreliable, same as before */
+            out->framing_ok = true;
+            out->ready = true;
+            return;
+        }
+    }
+
+    /* Pass 2: fill in the type values. Framing already validated above,
+     * so no bounds re-checking needed here. */
+    uint32_t fill_offset = offset;
+    for (uint16_t i = 0; i < ext_count; i++) {
+        uint16_t etype = (uint16_t)((buf[fill_offset] << 8) | buf[fill_offset + 1]);
+        uint16_t elen = (uint16_t)((buf[fill_offset + 2] << 8) | buf[fill_offset + 3]);
+        out->types[i] = etype;
+        fill_offset += 4 + elen;
+    }
+
+    out->count = ext_count;
+    out->framing_ok = true;
     out->ready = true;
+}
+
+void TLSExtAuditFree(SslExtAudit *audit)
+{
+    if (audit == NULL) {
+        return;
+    }
+    if (audit->types != NULL) {
+        SCFree(audit->types);
+        audit->types = NULL;
+    }
+    audit->count = 0;
 }
 
 /**
@@ -117,10 +145,10 @@ int TLSExtAuditNoDuplicateExtTypes(const SslExtAudit *audit)
         return 1;
     }
 
-    if (!audit->ready || !audit->framing_ok || audit->truncated) {
+    if (!audit->ready || !audit->framing_ok || audit->alloc_failed) {
         SCLogDebug("unreliable TLS ext audit (ready=%u framing_ok=%u "
-                   "truncated=%u), skipping duplicate check",
-                   audit->ready, audit->framing_ok, audit->truncated);
+                   "alloc_failed=%u), skipping duplicate check",
+                   audit->ready, audit->framing_ok, audit->alloc_failed);
         return 1;
     }
 
@@ -155,9 +183,9 @@ int TLSExtAuditServerExtsSubsetOfClient(
     if (client_audit == NULL || server_audit == NULL) {
         return 1;
     }
-
-    if (!client_audit->ready || !client_audit->framing_ok || client_audit->truncated ||
-            !server_audit->ready || !server_audit->framing_ok || server_audit->truncated) {
+    
+    if (!client_audit->ready || !client_audit->framing_ok || client_audit->alloc_failed ||
+            !server_audit->ready || !server_audit->framing_ok || server_audit->alloc_failed) {
         SCLogDebug("unreliable client/server ext audit, skipping subset check");
         return 1;
     }
@@ -198,7 +226,7 @@ int TLSExtAuditServerNoGreaseNegotiated(const SslExtAudit *server_audit)
         return 1;
     }
 
-    if (!server_audit->ready || !server_audit->framing_ok || server_audit->truncated) {
+    if (!server_audit->ready || !server_audit->framing_ok || server_audit->alloc_failed) {
         SCLogDebug("unreliable server ext audit, skipping GREASE check");
         return 1;
     }
@@ -234,7 +262,7 @@ int TLSExtAuditServerNoSignatureAlgorithms(const SslExtAudit *server_audit)
         return 1;
     }
 
-    if (!server_audit->ready || !server_audit->framing_ok || server_audit->truncated) {
+    if (!server_audit->ready || !server_audit->framing_ok || server_audit->alloc_failed) {
         SCLogDebug("unreliable server ext audit, skipping signature_algorithms check");
         return 1;
     }
@@ -279,10 +307,10 @@ int TLSExtAuditPreSharedKeyIsLast(const SslExtAudit *client_audit)
         return 1;
     }
 
-    if (!client_audit->ready || !client_audit->framing_ok || client_audit->truncated) {
+    if (!client_audit->ready || !client_audit->framing_ok || client_audit->alloc_failed) {
         SCLogDebug("unreliable client ext audit (ready=%u framing_ok=%u "
-                   "truncated=%u), skipping pre_shared_key position check",
-                   client_audit->ready, client_audit->framing_ok, client_audit->truncated);
+                   "alloc_failed=%u), skipping pre_shared_key position check",
+                   client_audit->ready, client_audit->framing_ok, client_audit->alloc_failed);
         return 1;
     }
 

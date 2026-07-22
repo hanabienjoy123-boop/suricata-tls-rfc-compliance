@@ -418,7 +418,7 @@ static void TLSExtAuditRunChecks(SSLState *ssl_state)
     if (!TLSExtAuditNoDuplicateExtTypes(c)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_DUPLICATE_EXTENSIONS);
     }
-    
+
     if (!TLSExtAuditServerExtsSubsetOfClient(c, s)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_UNPROPOSED_EXTENSION);
     }
@@ -434,6 +434,12 @@ static void TLSExtAuditRunChecks(SSLState *ssl_state)
     if (!TLSExtAuditPreSharedKeyIsLast(c)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION);
     }
+
+    /* Both sides' audit data has served its purpose (all checks above have
+     * run); free it now rather than leaving it to linger until the
+     * SSLState itself is torn down. */
+    TLSExtAuditFree(&ssl_state->client_connp.ext_audit);
+    TLSExtAuditFree(&ssl_state->server_connp.ext_audit);
 }
 
 static void TlsDecodeHSCertificateErrSetEvent(SSLState *ssl_state, uint32_t err)
@@ -1303,9 +1309,9 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
     SCLogDebug("Audit status: ready=%u framing_ok=%u truncated=%u count=%u",
         ssl_state->curr_connp->ext_audit.ready,
         ssl_state->curr_connp->ext_audit.framing_ok,
-        ssl_state->curr_connp->ext_audit.truncated,
+        ssl_state->curr_connp->ext_audit.alloc_failed,
         ssl_state->curr_connp->ext_audit.count);
-    
+        
     for (uint16_t i = 0; i < ssl_state->curr_connp->ext_audit.count; i++) {
         SCLogDebug("  ext[%u]=0x%04x (%u)", i,
         ssl_state->curr_connp->ext_audit.types[i],
@@ -1600,6 +1606,7 @@ static int TLSDecodeHandshakeHello(SSLState *ssl_state,
         UpdateServerState(ssl_state, TLS_STATE_SERVER_HELLO);
         TLSExtAuditRunChecks(ssl_state);
     }
+    
 end:
     return 0;
 }
@@ -2958,7 +2965,15 @@ static void SSLStateFree(void *p)
         SCFree(ssl_state->server_connp.ja3_hash);
     if (ssl_state->server_connp.hs_buffer)
         SCFree(ssl_state->server_connp.hs_buffer);
-
+    
+    /* RFC audit data: normally freed by TLSExtAuditRunChecks() once both
+     * sides have been checked. This is a safety net for cases where the
+     * connection never reached that point (parse error, or only one side
+     * of the handshake was ever seen). TLSExtAuditFree() is idempotent,
+     * so this is safe even if the data was already freed. */
+    TLSExtAuditFree(&ssl_state->client_connp.ext_audit);
+    TLSExtAuditFree(&ssl_state->server_connp.ext_audit);
+    
     SSLStateCertSANFree(&ssl_state->server_connp);
     SSLStateCertSANFree(&ssl_state->client_connp);
 

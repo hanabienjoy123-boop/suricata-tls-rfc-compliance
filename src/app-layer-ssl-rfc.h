@@ -34,21 +34,16 @@
 /* pre_shared_key extension type, RFC 8446 Section 4.2.11 */
 #define SSL_EXT_PRE_SHARED_KEY 0x0029
 
-/* Maximum number of extension types recorded from a single Hello.
- * Beyond this the list is truncated and the `truncated` flag is set. */
-#define SSL_EXT_AUDIT_MAX 64
-
-
 /**
  * \brief Structure to audit and store extracted TLS Hello Extension types.
  */
-typedef struct SslExtAudit_ {
-    uint16_t types[SSL_EXT_AUDIT_MAX]; /**< Extension types in order (including GREASE) */
-    uint16_t count;                    /**< Number of entries actually stored */
 
+typedef struct SslExtAudit_ {
+    uint16_t *types; /**< Dynamically allocated; NULL if no extensions or audit not yet run. Owned by this struct. */
+    uint16_t count;                    /**< Number of entries actually stored */
     uint8_t ready;        /**< This side's Hello extensions have been parsed */
     uint8_t framing_ok;   /**< Frame consumed exactly to the boundary (trust premise) */
-    uint8_t truncated;    /**< More than MAX extensions seen; types[] is incomplete */
+    uint8_t alloc_failed; /**< SCMalloc() for types[] failed (OOM);*   types is NULL and count is 0. Treated as*   unreliable, same as a framing failure. */
 } SslExtAudit;
 
 void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *out);
@@ -57,5 +52,6 @@ int TLSExtAuditServerExtsSubsetOfClient(const SslExtAudit *client_audit, const S
 int TLSExtAuditServerNoGreaseNegotiated(const SslExtAudit *server_audit);
 int TLSExtAuditServerNoSignatureAlgorithms(const SslExtAudit *server_audit);
 int TLSExtAuditPreSharedKeyIsLast(const SslExtAudit *client_audit);
+void TLSExtAuditFree(SslExtAudit *audit);
 
 #endif /* SURICATA_APP_LAYER_TLS_RFC_H */
