@@ -54,3 +54,67 @@ alert tls any any -> any any (msg:"TLS pre_shared_key extension not last in Clie
     classtype:protocol-command-decode; \
     reference:url,datatracker.ietf.org/doc/html/rfc8446#section-4.2.11; \
     sid:1000006; rev:1;)
+
+# max_fragment_length extension value outside RFC 6066 §4 defined range (1-4)
+# ref: RFC 6066 §4
+alert tls any any -> any any (msg:"TLS max_fragment_length value out of RFC range"; \
+    flow:established; \
+    app-layer-event:tls.invalid_max_fragment_length; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-4; \
+    sid:1000007; rev:1;)
+
+# server responded with a legal but different max_fragment_length value
+# than the one requested by the client
+# ref: RFC 6066 §4
+alert tls any any -> any any (msg:"TLS server negotiated unrequested max_fragment_length"; \
+    flow:established,to_client; \
+    app-layer-event:tls.unrequested_max_fragment_length; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-4; \
+    sid:1000008; rev:1;)
+
+# server selected a cipher suite the client never offered
+# ref: RFC 5246 §7.4.1.3 / RFC 8446 §4.1.3
+alert tls any any -> any any (msg:"TLS server selected unproposed cipher suite"; \
+    flow:established,to_client; \
+    app-layer-event:tls.unproposed_cipher_suite; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc8446#section-4.1.3; \
+    sid:1000009; rev:1;)
+
+# server negotiated a GREASE value as its selected cipher suite
+# ref: RFC 8701 §3
+alert tls any any -> any any (msg:"TLS server negotiated GREASE cipher suite"; \
+    flow:established,to_client; \
+    app-layer-event:tls.server_negotiated_grease_cipher_suite; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc8701#section-3; \
+    sid:1000010; rev:1;)
+
+# server selected an RC4 cipher suite
+# ref: RFC 7465 §2 (rule 2: server MUST NOT select RC4)
+alert tls any any -> any any (msg:"TLS server negotiated RC4 cipher suite"; \
+    flow:established,to_client; \
+    app-layer-event:tls.server_negotiated_rc4_cipher_suite; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc7465#section-2; \
+    sid:1000011; rev:1;)
+
+# client's cipher suite list consisted exclusively of RC4 cipher suites
+# ref: RFC 7465 §2 (rule 3: if client only offers RC4, server MUST terminate)
+alert tls any any -> any any (msg:"TLS client cipher suites list is RC4-only"; \
+    flow:established,to_server; \
+    app-layer-event:tls.client_cipher_suites_rc4_only; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc7465#section-2; \
+    sid:1000012; rev:1;)
+
+# client proposed at least one RC4 cipher suite
+# ref: RFC 7465 §2 (rule 1: client MUST NOT include RC4 in ClientHello)
+alert tls any any -> any any (msg:"TLS client proposed RC4 cipher suite"; \
+    flow:established,to_server; \
+    app-layer-event:tls.client_proposed_rc4_cipher_suite; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc7465#section-2; \
+    sid:1000013; rev:1;)

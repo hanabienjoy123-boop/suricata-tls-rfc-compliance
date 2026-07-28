@@ -79,6 +79,15 @@ enum {
     TLS_DECODER_EVENT_UNPROPOSED_EXTENSION,
     TLS_DECODER_EVENT_SERVER_INVALID_SIGNATURE_ALGORITHMS,
     TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION,
+    TLS_DECODER_EVENT_INVALID_MAX_FRAGMENT_LENGTH,
+    TLS_DECODER_EVENT_UNREQUESTED_MAX_FRAGMENT_LENGTH,
+    // RFC conformance checks on cipher suite lists
+    TLS_DECODER_EVENT_UNPROPOSED_CIPHER_SUITE,
+    TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_CIPHER_SUITE,
+    /* RFC 7465: RC4 prohibition */
+    TLS_DECODER_EVENT_SERVER_NEGOTIATED_RC4_CIPHER_SUITE,
+    TLS_DECODER_EVENT_CLIENT_PROPOSED_RC4_CIPHER_SUITE,
+    TLS_DECODER_EVENT_CLIENT_CIPHER_SUITES_RC4_ONLY,
 };
 
 enum TlsStateClient {
@@ -151,6 +160,7 @@ enum TlsStateServer {
 
 /* extensions */
 #define SSL_EXTENSION_SNI                       0x0000
+#define SSL_EXTENSION_MAX_FRAGMENT_LENGTH       0x0001
 #define SSL_EXTENSION_ELLIPTIC_CURVES           0x000a
 #define SSL_EXTENSION_EC_POINT_FORMATS          0x000b
 #define SSL_EXTENSION_SIGNATURE_ALGORITHMS      0x000d
@@ -223,9 +233,10 @@ typedef struct SSLStateConnp_ {
 
     JA3Buffer *ja3_str;
     char *ja3_hash;
-
+    
     HandshakeParams *hs;
     SslExtAudit ext_audit;
+    SslCipherAudit cipher_audit;
     /* handshake tls fragmentation buffer. Handshake messages can be fragmented over multiple
      * TLS records. */
     uint8_t *hs_buffer;

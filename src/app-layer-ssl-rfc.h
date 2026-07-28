@@ -34,9 +34,23 @@
 /* pre_shared_key extension type, RFC 8446 Section 4.2.11 */
 #define SSL_EXT_PRE_SHARED_KEY 0x0029
 
+/* max_fragment_length extension type, RFC 6066 Section 4 */
+#define SSL_EXTENSION_MAX_FRAGMENT_LENGTH       0x0001
 /**
  * \brief Structure to audit and store extracted TLS Hello Extension types.
  */
+
+ /**
+ * \brief Which side of the handshake a piece of side-channel audit data
+ *        or wire-format input pertains to. Used across the RFC
+ *        conformance audit functions (cipher suites, extensions, etc.)
+ *        wherever ClientHello/ServerHello wire-format differences
+ *        require different parsing behavior.
+ */
+typedef enum {
+    TLS_HS_DIRECTION_CLIENT = 0,
+    TLS_HS_DIRECTION_SERVER = 1,
+} TlsHandshakeDirection;
 
 typedef struct SslExtAudit_ {
     uint16_t *types; /**< Dynamically allocated; NULL if no extensions or audit not yet run. Owned by this struct. */
@@ -44,14 +58,38 @@ typedef struct SslExtAudit_ {
     uint8_t ready;        /**< This side's Hello extensions have been parsed */
     uint8_t framing_ok;   /**< Frame consumed exactly to the boundary (trust premise) */
     uint8_t alloc_failed; /**< SCMalloc() for types[] failed (OOM);*   types is NULL and count is 0. Treated as*   unreliable, same as a framing failure. */
+    uint8_t max_fragment_length; /**< If the max_fragment_length extension was present, this is the value. Otherwise 0. */
 } SslExtAudit;
 
+typedef struct SslCipherAudit_ {
+    uint8_t *ciphers;   /**< Dynamically allocated. NULL if none or audit
+                          *   not yet run. Owned by this struct. Raw
+                          *   network-byte-order bytes, 2 bytes per cipher
+                          *   suite entry, NOT converted to host uint16_t.
+                          *   For ServerHello this will contain at most
+                          *   one entry (the selected cipher suite). */
+    uint16_t count;      /**< number of cipher suite entries (NOT byte count) */
+
+    uint8_t ready;
+    uint8_t framing_ok;
+    uint8_t alloc_failed;
+} SslCipherAudit;
+
 void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *out);
+void TLSExtAuditFree(SslExtAudit *audit);
 int TLSExtAuditNoDuplicateExtTypes(const SslExtAudit *audit);
 int TLSExtAuditServerExtsSubsetOfClient(const SslExtAudit *client_audit, const SslExtAudit *server_audit);
 int TLSExtAuditServerNoGreaseNegotiated(const SslExtAudit *server_audit);
 int TLSExtAuditServerNoSignatureAlgorithms(const SslExtAudit *server_audit);
 int TLSExtAuditPreSharedKeyIsLast(const SslExtAudit *client_audit);
-void TLSExtAuditFree(SslExtAudit *audit);
-
+int TLSExtAuditMaxFragmentLengthValid(const SslExtAudit *audit);
+int TLSExtAuditMaxFragmentLengthMatchesRequest(const SslExtAudit *client_audit, const SslExtAudit *server_audit);
+//section for cipher suites audition
+void TLSExtractHSHelloCipherSuites(const uint8_t *buf, uint32_t len, TlsHandshakeDirection direction, SslCipherAudit *out);
+void TLSCipherAuditFree(SslCipherAudit *audit);
+int TLSCipherAuditServerSelectedInClientList(const SslCipherAudit *client_audit, const SslCipherAudit *server_audit);
+int TLSCipherAuditServerNoGreaseSelected(const SslCipherAudit *server_audit);
+int TLSCipherAuditServerIsRC4(const SslCipherAudit *server_audit);
+int TLSCipherAuditClientOnlyRC4(const SslCipherAudit *client_audit);
+int TLSCipherAuditClientProposedRC4(const SslCipherAudit *client_audit);
 #endif /* SURICATA_APP_LAYER_TLS_RFC_H */

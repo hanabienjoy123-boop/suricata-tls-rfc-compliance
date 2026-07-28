@@ -174,6 +174,14 @@ SCEnumCharMap tls_decoder_event_table[] = {
     { "UNPROPOSED_EXTENSION", TLS_DECODER_EVENT_UNPROPOSED_EXTENSION },
     { "SERVER_INVALID_SIGNATURE_ALGORITHMS", TLS_DECODER_EVENT_SERVER_INVALID_SIGNATURE_ALGORITHMS },
     { "PSK_NOT_LAST_EXTENSION", TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION },
+    { "INVALID_MAX_FRAGMENT_LENGTH", TLS_DECODER_EVENT_INVALID_MAX_FRAGMENT_LENGTH },
+    { "UNREQUESTED_MAX_FRAGMENT_LENGTH", TLS_DECODER_EVENT_UNREQUESTED_MAX_FRAGMENT_LENGTH },
+    /* RFC conformance checks on cipher_suites */
+    { "UNPROPOSED_CIPHER_SUITE", TLS_DECODER_EVENT_UNPROPOSED_CIPHER_SUITE },
+    { "SERVER_NEGOTIATED_GREASE_CIPHER_SUITE",  TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_CIPHER_SUITE },
+    { "SERVER_NEGOTIATED_RC4_CIPHER_SUITE",     TLS_DECODER_EVENT_SERVER_NEGOTIATED_RC4_CIPHER_SUITE },
+    { "CLIENT_PROPOSED_RC4_CIPHER_SUITE",       TLS_DECODER_EVENT_CLIENT_PROPOSED_RC4_CIPHER_SUITE },
+    { "CLIENT_CIPHER_SUITES_RC4_ONLY",          TLS_DECODER_EVENT_CLIENT_CIPHER_SUITES_RC4_ONLY },
     { NULL, -1 },
 };
 
@@ -434,12 +442,53 @@ static void TLSExtAuditRunChecks(SSLState *ssl_state)
     if (!TLSExtAuditPreSharedKeyIsLast(c)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_PSK_NOT_LAST_EXTENSION);
     }
+    
+    if (!TLSExtAuditMaxFragmentLengthValid(c)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_MAX_FRAGMENT_LENGTH);
+    }
 
+    if (!TLSExtAuditMaxFragmentLengthMatchesRequest(c, s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_UNREQUESTED_MAX_FRAGMENT_LENGTH);
+    }
     /* Both sides' audit data has served its purpose (all checks above have
      * run); free it now rather than leaving it to linger until the
      * SSLState itself is torn down. */
     TLSExtAuditFree(&ssl_state->client_connp.ext_audit);
     TLSExtAuditFree(&ssl_state->server_connp.ext_audit);
+}
+
+static void TLSCipherAuditRunChecks(SSLState *ssl_state)
+{
+    const SslCipherAudit *c = &ssl_state->client_connp.cipher_audit;
+    const SslCipherAudit *s = &ssl_state->server_connp.cipher_audit;
+
+    if (!TLSCipherAuditServerSelectedInClientList(c, s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_UNPROPOSED_CIPHER_SUITE);
+    }
+
+    if (!TLSCipherAuditServerNoGreaseSelected(s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_NEGOTIATED_GREASE_CIPHER_SUITE);
+    }
+
+    /* RFC 7465 rule 2: server MUST NOT select an RC4 cipher suite.
+     * Highest priority of the three RC4 checks — this is a confirmed,
+     * actually-negotiated weak cipher, not just a proposal. */
+    if (!TLSCipherAuditServerIsRC4(s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_NEGOTIATED_RC4_CIPHER_SUITE);
+    }
+
+    /* RFC 7465 rule 3: if the client's cipher suite list is RC4-only,
+     * the server is required to terminate the handshake. */
+    if (!TLSCipherAuditClientOnlyRC4(c)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_CLIENT_CIPHER_SUITES_RC4_ONLY);
+    }
+
+    /* RFC 7465 rule 1: client MUST NOT include RC4 in the ClientHello.
+     * Lowest priority / noisiest of the three — many legacy clients
+     * still do this for compatibility even though it's non-compliant. */
+    if (!TLSCipherAuditClientProposedRC4(c)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_CLIENT_PROPOSED_RC4_CIPHER_SUITE);
+    }
 }
 
 static void TlsDecodeHSCertificateErrSetEvent(SSLState *ssl_state, uint32_t err)
@@ -839,6 +888,26 @@ static inline int TLSDecodeHSHelloCipherSuites(SSLState *ssl_state,
                                            const uint8_t * const initial_input,
                                            const uint32_t input_len)
 {
+    if (ssl_state->current_flags & SSL_AL_FLAG_STATE_SERVER_HELLO) {
+        TLSExtractHSHelloCipherSuites(initial_input, input_len, TLS_HS_DIRECTION_SERVER,
+                &ssl_state->curr_connp->cipher_audit);
+    } else if (ssl_state->current_flags & SSL_AL_FLAG_STATE_CLIENT_HELLO) {
+        TLSExtractHSHelloCipherSuites(initial_input, input_len, TLS_HS_DIRECTION_CLIENT,
+                &ssl_state->curr_connp->cipher_audit);
+    }
+
+    SCLogDebug("Cipher audit status: ready=%u framing_ok=%u alloc_failed=%u count=%u",
+            ssl_state->curr_connp->cipher_audit.ready,
+            ssl_state->curr_connp->cipher_audit.framing_ok,
+            ssl_state->curr_connp->cipher_audit.alloc_failed,
+            ssl_state->curr_connp->cipher_audit.count);
+
+    for (uint16_t i = 0; i < ssl_state->curr_connp->cipher_audit.count; i++) {
+        uint16_t cipher = (uint16_t)((ssl_state->curr_connp->cipher_audit.ciphers[i * 2] << 8) |
+                                  ssl_state->curr_connp->cipher_audit.ciphers[i * 2 + 1]);
+        SCLogDebug("  cipher[%u]=0x%04x", i, cipher);
+    }
+    
     const uint8_t *input = initial_input;
 
     if (!(HAS_SPACE(2)))
@@ -1306,12 +1375,13 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
                                          const uint32_t input_len)
 {
     TLSExtractHSHelloExtTypes(initial_input, input_len, &ssl_state->curr_connp->ext_audit);
-    SCLogDebug("Audit status: ready=%u framing_ok=%u truncated=%u count=%u",
+    SCLogDebug("Audit status: ready=%u framing_ok=%u alloc_failed=%u count=%u max_fragment_length=%u",
         ssl_state->curr_connp->ext_audit.ready,
         ssl_state->curr_connp->ext_audit.framing_ok,
         ssl_state->curr_connp->ext_audit.alloc_failed,
-        ssl_state->curr_connp->ext_audit.count);
-        
+        ssl_state->curr_connp->ext_audit.count,
+        ssl_state->curr_connp->ext_audit.max_fragment_length);
+
     for (uint16_t i = 0; i < ssl_state->curr_connp->ext_audit.count; i++) {
         SCLogDebug("  ext[%u]=0x%04x (%u)", i,
         ssl_state->curr_connp->ext_audit.types[i],
@@ -1605,6 +1675,7 @@ static int TLSDecodeHandshakeHello(SSLState *ssl_state,
     } else {
         UpdateServerState(ssl_state, TLS_STATE_SERVER_HELLO);
         TLSExtAuditRunChecks(ssl_state);
+        TLSCipherAuditRunChecks(ssl_state);
     }
     
 end:
@@ -2973,7 +3044,10 @@ static void SSLStateFree(void *p)
      * so this is safe even if the data was already freed. */
     TLSExtAuditFree(&ssl_state->client_connp.ext_audit);
     TLSExtAuditFree(&ssl_state->server_connp.ext_audit);
-    
+
+    TLSCipherAuditFree(&ssl_state->client_connp.cipher_audit);
+    TLSCipherAuditFree(&ssl_state->server_connp.cipher_audit);
+
     SSLStateCertSANFree(&ssl_state->server_connp);
     SSLStateCertSANFree(&ssl_state->client_connp);
 

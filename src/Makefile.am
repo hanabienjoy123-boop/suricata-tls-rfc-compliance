@@ -48,6 +48,7 @@ noinst_HEADERS = \
 	app-layer-ssh.h \
 	app-layer-ssl.h \
 	app-layer-ssl-rfc.h \
+	ssl-cipher-suite-mode.h \
 	app-layer-tftp.h \
 	app-layer.h \
 	bindgen.h \
@@ -320,6 +321,7 @@ noinst_HEADERS = \
 	detect-tls-ja3s-string.h \
 	detect-tls-random.h \
 	detect-tls-random-reused.h \
+	detect-tls-cipher-suite.h \
 	detect-tls-sni.h \
 	detect-tls-subjectaltname.h \
 	detect-tls-version.h \
@@ -654,6 +656,7 @@ libsuricata_c_a_SOURCES = \
 	app-layer-ssh.c \
 	app-layer-ssl.c \
 	app-layer-ssl-rfc.c \
+	ssl-cipher-suite-mode.c \
 	app-layer-tftp.c \
 	app-layer.c \
 	conf-yaml-loader.c \
@@ -923,6 +926,7 @@ libsuricata_c_a_SOURCES = \
 	detect-tls-ja3s-string.c \
 	detect-tls-random.c \
 	detect-tls-random-reused.c \
+	detect-tls-cipher-suite.c \
 	detect-tls-sni.c \
 	detect-tls-subjectaltname.c \
 	detect-tls-version.c \
