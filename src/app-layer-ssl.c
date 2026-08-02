@@ -182,6 +182,13 @@ SCEnumCharMap tls_decoder_event_table[] = {
     { "SERVER_NEGOTIATED_RC4_CIPHER_SUITE",     TLS_DECODER_EVENT_SERVER_NEGOTIATED_RC4_CIPHER_SUITE },
     { "CLIENT_PROPOSED_RC4_CIPHER_SUITE",       TLS_DECODER_EVENT_CLIENT_PROPOSED_RC4_CIPHER_SUITE },
     { "CLIENT_CIPHER_SUITES_RC4_ONLY",          TLS_DECODER_EVENT_CLIENT_CIPHER_SUITES_RC4_ONLY },
+    { "SERVER_UNREQUESTED_STATUS_REQUEST_EXTENSION", TLS_DECODER_EVENT_SERVER_UNREQUESTED_STATUS_REQUEST_EXTENSION },
+    { "SERVER_ENCRYPT_THEN_MAC_WITHOUT_BLOCK_CIPHER", TLS_DECODER_EVENT_SERVER_ENCRYPT_THEN_MAC_WITHOUT_BLOCK_CIPHER },
+    { "INVALID_PADDING_EXTENSION", TLS_DECODER_EVENT_INVALID_PADDING_EXTENSION },
+    { "PADDING_EXTENSION_ECHOED",  TLS_DECODER_EVENT_PADDING_EXTENSION_ECHOED },
+    { "SERVER_SNI_LENGTH_NOT_ZERO", TLS_DECODER_EVENT_SERVER_SNI_LENGTH_NOT_ZERO },
+    { "SNI_IN_RESUMED_SESSION", TLS_DECODER_EVENT_SNI_IN_RESUMED_SESSION },
+    { "INVALID_HOSTNAME_FORMAT", TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT },
     { NULL, -1 },
 };
 
@@ -453,6 +460,11 @@ static void TLSExtAuditRunChecks(SSLState *ssl_state)
     /* Both sides' audit data has served its purpose (all checks above have
      * run); free it now rather than leaving it to linger until the
      * SSLState itself is torn down. */
+
+     if (!TLSExtAuditServerStatusRequestOfferedByClient(c, s)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_UNREQUESTED_STATUS_REQUEST_EXTENSION);
+    }
+
     TLSExtAuditFree(&ssl_state->client_connp.ext_audit);
     TLSExtAuditFree(&ssl_state->server_connp.ext_audit);
 }
@@ -488,6 +500,11 @@ static void TLSCipherAuditRunChecks(SSLState *ssl_state)
      * still do this for compatibility even though it's non-compliant. */
     if (!TLSCipherAuditClientProposedRC4(c)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_CLIENT_PROPOSED_RC4_CIPHER_SUITE);
+    }
+
+    if (!TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
+                &ssl_state->server_connp.ext_audit, &ssl_state->server_connp.cipher_audit)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_ENCRYPT_THEN_MAC_WITHOUT_BLOCK_CIPHER);
     }
 }
 
@@ -1018,11 +1035,115 @@ invalid_length:
     return -1;
 }
 
+static inline void TLSCheckSNIHostnameFormat(SSLState *ssl_state,
+                                             const uint8_t *sni,
+                                             const uint16_t sni_len)
+{
+    if (sni == NULL || sni_len == 0)
+        return;
+
+    /* --- non-ASCII check --- */
+    for (uint16_t i = 0; i < sni_len; i++) {
+        if (sni[i] >= 0x80) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT);
+            return;
+        }
+    }
+
+    /* --- trailing dot check --- */
+    if (sni[sni_len - 1] == 0x2E /* '.' */) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT);
+        return;
+    }
+
+    /* --- IPv4 literal check --- */
+    {
+        int groups = 1;
+        int digits_in_group = 0;
+        bool only_digits_and_dots = true;
+        uint32_t group_val = 0;
+        bool looks_like_ipv4 = true;
+
+        for (uint16_t i = 0; i < sni_len; i++) {
+            uint8_t c = sni[i];
+            if (c == 0x2E /* '.' */) {
+                if (digits_in_group == 0 || group_val > 255) {
+                    looks_like_ipv4 = false;
+                    break;
+                }
+                groups++;
+                digits_in_group = 0;
+                group_val = 0;
+            } else if (c >= 0x30 && c <= 0x39) {
+                digits_in_group++;
+                if (digits_in_group > 3) {
+                    looks_like_ipv4 = false;
+                    break;
+                }
+                group_val = group_val * 10 + (c - 0x30);
+            } else {
+                only_digits_and_dots = false;
+                looks_like_ipv4 = false;
+                break;
+            }
+        }
+        if (only_digits_and_dots && looks_like_ipv4 &&
+                groups == 4 && digits_in_group != 0 && group_val <= 255) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT);
+            return;
+        }
+    }
+
+    /* --- IPv6 literal check --- */
+    {
+        bool has_colon = false;
+        bool only_hex_and_colon = true;
+
+        for (uint16_t i = 0; i < sni_len; i++) {
+            uint8_t c = sni[i];
+            if (c == 0x3A) {
+                has_colon = true;
+            } else if (!((c >= 0x30 && c <= 0x39) ||
+                         (c >= 0x41 && c <= 0x46) ||
+                         (c >= 0x61 && c <= 0x66))) {
+                only_hex_and_colon = false;
+                break;
+            }
+        }
+        if (has_colon && only_hex_and_colon) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT);
+            return;
+        }
+    }
+}
+
 static inline int TLSDecodeHSHelloExtensionSni(SSLState *ssl_state,
                                            const uint8_t * const initial_input,
                                            const uint32_t input_len)
 {
     uint8_t *input = (uint8_t *)initial_input;
+
+    if (ssl_state->current_flags & SSL_AL_FLAG_STATE_SERVER_HELLO) {
+        /* RFC 6066 Section 3: "In this event, the server SHALL include
+         * an extension of type "server_name" in the (extended) server
+         * hello. The "extension_data" field of this extension SHALL
+         * be empty."
+         * i.e. a ServerHello's SNI extension must never carry content -
+         * it's a zero-length acknowledgement, not a real hostname. */
+        if (input_len != 0) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_SNI_LENGTH_NOT_ZERO);
+        }
+
+        /* RFC 6066 Section 3: "When resuming a session, the server
+         * MUST NOT include a server_name extension in the server
+         * hello."
+         * Even though the content above is valid (empty), the mere
+         * presence of this extension type is already a violation if
+         * this ServerHello belongs to a resumed session. */
+        if (ssl_state->flags & SSL_AL_FLAG_SESSION_RESUMED) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SNI_IN_RESUMED_SESSION);
+        }
+    }
 
     /* Empty extension */
     if (input_len == 0)
@@ -1087,7 +1208,7 @@ static inline int TLSDecodeHSHelloExtensionSni(SSLState *ssl_state,
         return -1;
     }
     input += sni_len;
-
+    TLSCheckSNIHostnameFormat(ssl_state, ssl_state->curr_connp->sni, ssl_state->curr_connp->sni_len);
     return (int)(input - initial_input);
 
 invalid_length:
@@ -1370,6 +1491,42 @@ invalid_length:
     return -1;
 }
 
+/**
+ * \brief Decode and validate the TLS ClientHello "padding" extension
+ *        (RFC 7685). The entire extension_data MUST be all-zero bytes.
+ *        A server MUST NOT echo this extension.
+ *
+ * Non-conformance here is a *content* violation, not a framing/length
+ * error, so parsing continues either way (mirrors how other soft
+ * violations are handled elsewhere in this parser) — only invalid
+ * length (buffer overrun) is treated as fatal via goto invalid_length
+ * in the caller.
+ */
+static inline int TLSDecodeHSHelloExtensionPadding(SSLState *ssl_state,
+                                                    const uint8_t * const initial_input,
+                                                    const uint32_t input_len)
+{
+    const uint8_t *input = initial_input;
+
+    /* RFC 7685 §3: "The server MUST NOT echo the extension." */
+    if (ssl_state->current_flags & SSL_AL_FLAG_STATE_SERVER_HELLO) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_PADDING_EXTENSION_ECHOED);
+    }
+
+    /* RFC 7685 §3: "The client MUST fill the padding extension
+     * completely with zero bytes." */
+    for (uint32_t i = 0; i < input_len; i++) {
+        if (input[i] != 0x00) {
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_PADDING_EXTENSION);
+            break;
+        }
+    }
+
+    input += input_len;
+
+    return (int)(input - initial_input);
+}
+
 static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
                                          const uint8_t * const initial_input,
                                          const uint32_t input_len)
@@ -1545,7 +1702,17 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
 
                 break;
             }
+            case SSL_EXTENSION_PADDING:
+            {
+                ret = TLSDecodeHSHelloExtensionPadding(ssl_state, input, ext_len);
 
+                if (ret < 0)
+                goto end;
+
+                input += ret;
+
+                break;
+            }
             default:
             {
                 input += ext_len;

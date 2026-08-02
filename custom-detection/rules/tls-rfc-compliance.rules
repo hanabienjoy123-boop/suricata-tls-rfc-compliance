@@ -118,3 +118,67 @@ alert tls any any -> any any (msg:"TLS client proposed RC4 cipher suite"; \
     classtype:protocol-command-decode; \
     reference:url,datatracker.ietf.org/doc/html/rfc7465#section-2; \
     sid:1000013; rev:1;)
+
+# server sent an unrequested status_request (OCSP stapling) extension
+# ref: RFC 6066 §8 (server MUST NOT send status_request unless offered by client)
+alert tls any any -> any any (msg:"TLS server sent unrequested status_request extension"; \
+    flow:established,to_client; \
+    app-layer-event:tls.server_unrequested_status_request_extension; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-8; \
+    sid:1000014; rev:1;)
+
+# client sent a padding extension whose extension_data is not all zero bytes
+# ref: RFC 7685 §3 (client MUST fill the padding extension completely with zero bytes)
+alert tls any any -> any any (msg:"TLS client sent non-zero padding extension content"; \
+    flow:established,to_server; \
+    app-layer-event:tls.invalid_padding_extension; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc7685#section-3; \
+    sid:1000015; rev:1;)
+
+# server echoed the padding extension in its ServerHello
+# ref: RFC 7685 §3 (server MUST NOT echo the extension)
+alert tls any any -> any any (msg:"TLS server echoed padding extension"; \
+    flow:established,to_client; \
+    app-layer-event:tls.padding_extension_echoed; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc7685#section-3; \
+    sid:1000016; rev:1;)
+
+# client sent an SNI extension with an invalid hostname length
+# (must be 1-255 bytes per RFC 6066 §3, bounded by max DNS name length)
+alert tls any any -> any any (msg:"TLS client SNI extension invalid length"; \
+    flow:established,to_server; \
+    app-layer-event:tls.invalid_sni_length; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-3; \
+    sid:1000017; rev:1;)
+
+# server included a non-empty SNI extension in its ServerHello
+# ref: RFC 6066 §3 ("extension_data" field of this extension SHALL be empty)
+alert tls any any -> any any (msg:"TLS server SNI extension length not zero"; \
+    flow:established,to_client; \
+    app-layer-event:tls.server_sni_length_not_zero; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-3; \
+    sid:1000018; rev:1;)
+
+# server included an SNI extension in a resumed session's ServerHello
+# ref: RFC 6066 §3 (server MUST NOT include a server_name extension
+# in the server hello when resuming a session)
+alert tls any any -> any any (msg:"TLS server SNI extension present in resumed session"; \
+    flow:established,to_client; \
+    app-layer-event:tls.sni_in_resumed_session; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-3; \
+    sid:1000019; rev:1;)
+
+# client sent an SNI hostname that violates RFC 6066 §3 format rules
+# (literal IP address, trailing dot, or non-ASCII characters)
+alert tls any any -> any any (msg:"TLS client SNI hostname invalid format"; \
+    flow:established,to_server; \
+    app-layer-event:tls.invalid_hostname_format; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6066#section-3; \
+    sid:1000020; rev:1;)

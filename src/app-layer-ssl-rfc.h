@@ -33,9 +33,13 @@
 
 /* pre_shared_key extension type, RFC 8446 Section 4.2.11 */
 #define SSL_EXT_PRE_SHARED_KEY 0x0029
+/* status_request extension type, RFC 8446 Section 4.2.10 */
+#define SSL_EXTENSION_STATUS_REQUEST 0x0005
 
 /* max_fragment_length extension type, RFC 6066 Section 4 */
 #define SSL_EXTENSION_MAX_FRAGMENT_LENGTH       0x0001
+// encrypt_then_mac extension type, RFC 7366 Section 3
+#define SSL_EXTENSION_ENCRYPT_THEN_MAC          0x0016
 /**
  * \brief Structure to audit and store extracted TLS Hello Extension types.
  */
@@ -75,6 +79,17 @@ typedef struct SslCipherAudit_ {
     uint8_t alloc_failed;
 } SslCipherAudit;
 
+typedef struct SslDhPublicAudit_ {
+    uint8_t *share;        /**< Dynamically allocated raw dh_Yc bytes,
+                             *   big-endian. NULL if not yet parsed or
+                             *   parse failed. Owned by this struct. */
+    uint16_t share_len;    /**< Length of share in bytes. 0 if absent. */
+
+    uint8_t ready;
+    uint8_t framing_ok;
+    uint8_t alloc_failed;
+} SslDhPublicAudit;
+
 void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *out);
 void TLSExtAuditFree(SslExtAudit *audit);
 int TLSExtAuditNoDuplicateExtTypes(const SslExtAudit *audit);
@@ -84,6 +99,8 @@ int TLSExtAuditServerNoSignatureAlgorithms(const SslExtAudit *server_audit);
 int TLSExtAuditPreSharedKeyIsLast(const SslExtAudit *client_audit);
 int TLSExtAuditMaxFragmentLengthValid(const SslExtAudit *audit);
 int TLSExtAuditMaxFragmentLengthMatchesRequest(const SslExtAudit *client_audit, const SslExtAudit *server_audit);
+int TLSExtAuditServerStatusRequestOfferedByClient(
+        const SslExtAudit *client_audit, const SslExtAudit *server_audit);
 //section for cipher suites audition
 void TLSExtractHSHelloCipherSuites(const uint8_t *buf, uint32_t len, TlsHandshakeDirection direction, SslCipherAudit *out);
 void TLSCipherAuditFree(SslCipherAudit *audit);
@@ -92,4 +109,6 @@ int TLSCipherAuditServerNoGreaseSelected(const SslCipherAudit *server_audit);
 int TLSCipherAuditServerIsRC4(const SslCipherAudit *server_audit);
 int TLSCipherAuditClientOnlyRC4(const SslCipherAudit *client_audit);
 int TLSCipherAuditClientProposedRC4(const SslCipherAudit *client_audit);
+int TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
+        const SslExtAudit *server_ext_audit, const SslCipherAudit *server_cipher_audit);
 #endif /* SURICATA_APP_LAYER_TLS_RFC_H */

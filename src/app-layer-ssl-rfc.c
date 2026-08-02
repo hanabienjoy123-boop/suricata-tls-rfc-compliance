@@ -443,6 +443,44 @@ int TLSExtAuditMaxFragmentLengthMatchesRequest(
     return 1;
 }
 
+
+int TLSExtAuditServerStatusRequestOfferedByClient(
+        const SslExtAudit *client_audit, const SslExtAudit *server_audit)
+{
+    if (client_audit == NULL || server_audit == NULL) {
+        return 1;
+    }
+
+    if (!client_audit->ready || !client_audit->framing_ok || client_audit->alloc_failed ||
+            !server_audit->ready || !server_audit->framing_ok || server_audit->alloc_failed) {
+        SCLogDebug("unreliable client/server ext audit, skipping status_request check");
+        return 1;
+    }
+
+    int server_has_status_request = 0;
+    for (uint16_t i = 0; i < server_audit->count; i++) {
+        if (server_audit->types[i] == SSL_EXTENSION_STATUS_REQUEST) {
+            server_has_status_request = 1;
+            break;
+        }
+    }
+
+    if (!server_has_status_request) {
+        /* server did not send it, nothing to check */
+        return 1;
+    }
+
+    for (uint16_t j = 0; j < client_audit->count; j++) {
+        if (client_audit->types[j] == SSL_EXTENSION_STATUS_REQUEST) {
+            return 1;
+        }
+    }
+
+    SCLogDebug("server sent status_request extension (0x%04x) not offered by client",
+            SSL_EXTENSION_STATUS_REQUEST);
+    return 0;
+}
+
 /**
  * \brief Side-channel audit of the cipher_suites field. Mirrors the
  * branching in TLSDecodeHSHelloCipherSuites(): ClientHello carries a
@@ -680,4 +718,129 @@ int TLSCipherAuditClientOnlyRC4(const SslCipherAudit *client_audit)
         }
     }
     return 0;
+}
+
+
+/**
+ * \brief Check that, if the server negotiated (echoed) the
+ *        encrypt_then_mac extension, the server's selected cipher suite
+ *        is actually a CBC-mode block cipher.
+ *
+ * RFC 7366 Section 3 defines Encrypt-then-MAC only for CBC-mode cipher
+ * suites; the extension has no defined meaning for stream, AEAD, or
+ * NULL ciphers. A server that echoes this extension while having
+ * selected a non-block cipher suite is not honoring the negotiation
+ * correctly.
+ *
+ * This function only looks at the server side: whether the client
+ * actually offered encrypt_then_mac in the first place is a separate
+ * concern (covered elsewhere, e.g. TLSExtAuditServerExtsSubsetOfClient).
+ *
+ * If the server's extension audit is unreliable, the extension was not
+ * present in the ServerHello, or the server has not yet selected a
+ * cipher suite, there is nothing to check.
+ *
+ * \param server_ext_audit ServerHello extension audit
+ * \param server_cipher_audit ServerHello cipher suite audit (selected suite)
+ *
+ * \retval 1 encrypt_then_mac not present in ServerHello, selected cipher
+ *           is a block cipher, cipher mode is unknown, or audit data is
+ *           unreliable
+ * \retval 0 encrypt_then_mac was present in ServerHello but the selected
+ *           cipher suite is not a CBC-mode block cipher
+ */
+int TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
+        const SslExtAudit *server_ext_audit, const SslCipherAudit *server_cipher_audit)
+{
+    if (server_ext_audit == NULL || server_cipher_audit == NULL) {
+        return 1;
+    }
+
+    if (!server_ext_audit->ready || !server_ext_audit->framing_ok ||
+            server_ext_audit->alloc_failed || !server_cipher_audit->ready ||
+            !server_cipher_audit->framing_ok || server_cipher_audit->alloc_failed) {
+        SCLogDebug("unreliable server ext/cipher audit, skipping "
+                   "encrypt_then_mac cipher mode check");
+        return 1;
+    }
+
+    int server_has_etm = 0;
+    for (uint16_t i = 0; i < server_ext_audit->count; i++) {
+        if (server_ext_audit->types[i] == SSL_EXTENSION_ENCRYPT_THEN_MAC) {
+            server_has_etm = 1;
+            break;
+        }
+    }
+
+    if (!server_has_etm) {
+        return 1;
+    }
+
+    if (server_cipher_audit->count == 0) {
+        /* cipher suite not yet selected */
+        return 1;
+    }
+
+    uint16_t selected = (uint16_t)((server_cipher_audit->ciphers[0] << 8) |
+                                    server_cipher_audit->ciphers[1]);
+
+    TlsCipherMode mode = TLSCipherSuiteGetMode(selected);
+
+    if (mode == TLS_CIPHER_MODE_UNKNOWN) {
+        return 1;
+    }
+
+    if (mode != TLS_CIPHER_MODE_BLOCK) {
+        SCLogDebug("encrypt_then_mac present in ServerHello but selected "
+                   "cipher suite 0x%04x is not a CBC-mode block cipher "
+                   "(mode=%d)",
+                   selected, mode);
+        return 0;
+    }
+
+    return 1;
+}
+
+
+
+void TLSExtractDHClientKeyExchange(const uint8_t *buf, uint32_t input_len, SslDhPublicAudit *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    const uint8_t *initial_input = buf;
+    const uint8_t *input = buf;
+
+    if ((uint64_t)(input - initial_input) + (uint64_t)2 > (uint64_t)input_len) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    uint16_t share_len = (uint16_t)((input[0] << 8) | input[1]);
+    input += 2;
+
+    if (share_len == 0) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    if ((uint64_t)(input - initial_input) + (uint64_t)share_len > (uint64_t)input_len) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    out->share = SCMalloc(share_len);
+    if (out->share == NULL) {
+        out->alloc_failed = true;
+        out->framing_ok = true;
+        out->ready = true;
+        return;
+    }
+
+    memcpy(out->share, input, share_len);
+    out->share_len = share_len;
+    out->framing_ok = true;
+    out->ready = true;
 }
