@@ -182,3 +182,55 @@ alert tls any any -> any any (msg:"TLS client SNI hostname invalid format"; \
     classtype:protocol-command-decode; \
     reference:url,datatracker.ietf.org/doc/html/rfc6066#section-3; \
     sid:1000020; rev:1;)
+
+# server replied with a SERVER-HELLO record using the SSLv2 record
+# format, i.e. it actually negotiated SSLv2 despite RFC 6176 §3
+# prohibiting TLS servers from completing an SSL 2.0 handshake
+alert tls any any -> any any (msg:"TLS server negotiated SSLv2 SERVER-HELLO - RFC6176 violation"; \
+    flow:established,to_client; \
+    ssl_state:server_hello; \
+    tls.version:sslv2; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6176#section-3; \
+    sid:1000021; rev:1;)
+
+
+    # ===== SSLv2-format ClientHello detection (RFC 6176 §3, client-side ban) =====
+# client sent a ClientHello using the SSLv2 record format - either the
+# 2-byte header (no padding) or 3-byte header (padding) variant - which
+# RFC 6176 §3 prohibits regardless of the version number declared inside
+# (pure SSLv2 and the backward-compatible variant are both covered)
+
+# --- 2-byte header variant: input[0] bit7=1, msg-type sits at offset 2 ---
+alert tcp any any -> any any (msg:"TLS client sent SSLv2-format ClientHello (2-byte header) - RFC6176 violation"; \
+    flow:established,to_server; \
+    flowbits:isnotset,ssl2.hello.checked; \
+    byte_test:1,&,0x80,0; \
+    content:"|01|"; depth:1; offset:2; \
+    flowbits:set,ssl2.hello.checked; \
+    flowbits:set,ssl2.hello.violation; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6176#section-3; \
+    sid:1000022; rev:1;)
+
+# --- 3-byte header variant: input[0] bit7=0, msg-type sits at offset 3 ---
+alert tcp any any -> any any (msg:"TLS client sent SSLv2-format ClientHello (3-byte header) - RFC6176 violation"; \
+    flow:established,to_server; \
+    flowbits:isnotset,ssl2.hello.checked; \
+    byte_test:1,&,0x80,0,relative,!0; \
+    content:"|01|"; depth:1; offset:3; \
+    flowbits:set,ssl2.hello.checked; \
+    flowbits:set,ssl2.hello.violation; \
+    classtype:protocol-command-decode; \
+    reference:url,datatracker.ietf.org/doc/html/rfc6176#section-3; \
+    sid:1000023; rev:1;)
+
+# --- fallback: mark "checked" even when neither variant matched, so we
+# never re-evaluate this flow's later packets once the first to_server
+# payload has been inspected ---
+alert tcp any any -> any any (msg:"ssl2 hello check done - no match"; \
+    flow:established,to_server; \
+    flowbits:isnotset,ssl2.hello.checked; \
+    flowbits:set,ssl2.hello.checked; \
+    noalert; \
+    sid:1000024; rev:1;)
