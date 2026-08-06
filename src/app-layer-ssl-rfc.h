@@ -24,6 +24,8 @@
 #ifndef SURICATA_APP_LAYER_TLS_RFC_H
 #define SURICATA_APP_LAYER_TLS_RFC_H
 
+#include "ssl-cipher-suite-mode.h"
+
 /* GREASE values reserved by RFC 8701: 0x?A?A pattern */
 #define TLS_EXT_IS_GREASE(x) (((x) & 0x0F0F) == 0x0A0A)
 
@@ -44,13 +46,6 @@
  * \brief Structure to audit and store extracted TLS Hello Extension types.
  */
 
- /**
- * \brief Which side of the handshake a piece of side-channel audit data
- *        or wire-format input pertains to. Used across the RFC
- *        conformance audit functions (cipher suites, extensions, etc.)
- *        wherever ClientHello/ServerHello wire-format differences
- *        require different parsing behavior.
- */
 typedef enum {
     TLS_HS_DIRECTION_CLIENT = 0,
     TLS_HS_DIRECTION_SERVER = 1,
@@ -90,6 +85,19 @@ typedef struct SslDhPublicAudit_ {
     uint8_t alloc_failed;
 } SslDhPublicAudit;
 
+typedef struct SslSupportedGroups_ {
+    uint8_t *groups;    /**< Dynamically allocated. NULL if none or audit
+                          *   not yet run. Owned by this struct. Raw
+                          *   network-byte-order bytes, 2 bytes per group
+                          *   entry. GREASE entries are filtered out and not
+                          *   stored. */
+    uint16_t count;      /**< number of group entries (NOT byte count) */
+
+    uint8_t ready;
+    uint8_t framing_ok;
+    uint8_t alloc_failed;
+} SslSupportedGroups;
+
 void TLSExtractHSHelloExtTypes(const uint8_t *buf, uint32_t len, SslExtAudit *out);
 void TLSExtAuditFree(SslExtAudit *audit);
 int TLSExtAuditNoDuplicateExtTypes(const SslExtAudit *audit);
@@ -111,4 +119,10 @@ int TLSCipherAuditClientOnlyRC4(const SslCipherAudit *client_audit);
 int TLSCipherAuditClientProposedRC4(const SslCipherAudit *client_audit);
 int TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
         const SslExtAudit *server_ext_audit, const SslCipherAudit *server_cipher_audit);
+int TLSCipherAuditServerIsDeprecated(const SslCipherAudit *server_audit);
+
+//section for supported groups audition
+void TLSExtractHSHelloSupportedGroups(
+        const uint8_t *buf, uint32_t len, SslSupportedGroups *out);
+void TLSSupportedGroupsAuditFree(SslSupportedGroups *audit);
 #endif /* SURICATA_APP_LAYER_TLS_RFC_H */

@@ -48,6 +48,7 @@ noinst_HEADERS = \
 	app-layer-ssh.h \
 	app-layer-ssl.h \
 	app-layer-ssl-rfc.h \
+	app-layer-ssl-names.h \
 	ssl-cipher-suite-mode.h \
 	app-layer-tftp.h \
 	app-layer.h \
@@ -656,6 +657,7 @@ libsuricata_c_a_SOURCES = \
 	app-layer-ssh.c \
 	app-layer-ssl.c \
 	app-layer-ssl-rfc.c \
+	app-layer-ssl-names.c \
 	ssl-cipher-suite-mode.c \
 	app-layer-tftp.c \
 	app-layer.c \

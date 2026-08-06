@@ -45,6 +45,7 @@
 #include "util-validate.h"
 
 #include "app-layer-ssl-rfc.h"
+#include "app-layer-ssl-names.h"
 
 static SCEnumCharMap tls_state_client_table[] = {
     {
@@ -189,6 +190,7 @@ SCEnumCharMap tls_decoder_event_table[] = {
     { "SERVER_SNI_LENGTH_NOT_ZERO", TLS_DECODER_EVENT_SERVER_SNI_LENGTH_NOT_ZERO },
     { "SNI_IN_RESUMED_SESSION", TLS_DECODER_EVENT_SNI_IN_RESUMED_SESSION },
     { "INVALID_HOSTNAME_FORMAT", TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT },
+    { "SERVER_DEPRECATED_CIPHER_SUITE", TLS_DECODER_EVENT_SERVER_DEPRECATED_CIPHER_SUITE },
     { NULL, -1 },
 };
 
@@ -505,6 +507,10 @@ static void TLSCipherAuditRunChecks(SSLState *ssl_state)
     if (!TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
                 &ssl_state->server_connp.ext_audit, &ssl_state->server_connp.cipher_audit)) {
         SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_ENCRYPT_THEN_MAC_WITHOUT_BLOCK_CIPHER);
+    }
+
+    if (!TLSCipherAuditServerIsDeprecated(&ssl_state->server_connp.cipher_audit)) {
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_SERVER_DEPRECATED_CIPHER_SUITE);
     }
 }
 
@@ -918,13 +924,16 @@ static inline int TLSDecodeHSHelloCipherSuites(SSLState *ssl_state,
             ssl_state->curr_connp->cipher_audit.framing_ok,
             ssl_state->curr_connp->cipher_audit.alloc_failed,
             ssl_state->curr_connp->cipher_audit.count);
-
+    
+    #ifdef DEBUG
     for (uint16_t i = 0; i < ssl_state->curr_connp->cipher_audit.count; i++) {
         uint16_t cipher = (uint16_t)((ssl_state->curr_connp->cipher_audit.ciphers[i * 2] << 8) |
-                                  ssl_state->curr_connp->cipher_audit.ciphers[i * 2 + 1]);
-        SCLogDebug("  cipher[%u]=0x%04x", i, cipher);
+                          ssl_state->curr_connp->cipher_audit.ciphers[i * 2 + 1]);
+        const char *name = TlsCipherModeGetName(cipher);
+        SCLogDebug("  cipher[%u]=0x%04x (%s)", i, cipher, name ? name : "unknown");
     }
-    
+    #endif
+
     const uint8_t *input = initial_input;
 
     if (!(HAS_SPACE(2)))
@@ -1291,6 +1300,23 @@ static inline int TLSDecodeHSHelloExtensionEllipticCurves(SSLState *ssl_state,
                                           const uint32_t input_len,
                                           JA3Buffer *ja3_elliptic_curves)
 {
+if (ssl_state->curr_connp->supported_groups_audit.groups == NULL &&
+        !ssl_state->curr_connp->supported_groups_audit.ready &&
+        (ssl_state->current_flags & SSL_AL_FLAG_STATE_CLIENT_HELLO)) {
+        TLSExtractHSHelloSupportedGroups(
+            initial_input, input_len, &ssl_state->curr_connp->supported_groups_audit);
+    }
+    
+    #ifdef DEBUG
+    SCLogDebug("stored %u supported_groups entries", ssl_state->curr_connp->supported_groups_audit.count);
+    for (uint16_t i = 0; i < ssl_state->curr_connp->supported_groups_audit.count; i++) {
+        uint16_t group = (uint16_t)(ssl_state->curr_connp->supported_groups_audit.groups[i * 2] << 8) |
+                      ssl_state->curr_connp->supported_groups_audit.groups[i * 2 + 1];
+        const char *name = TlsNamedGroupGetName(group);
+        SCLogDebug("  supported_groups[%u] = 0x%04x (%s)", i, group, name ? name : "unknown");
+    }
+    #endif
+
     const uint8_t *input = initial_input;
 
     /* Empty extension */
@@ -1526,6 +1552,569 @@ static inline int TLSDecodeHSHelloExtensionPadding(SSLState *ssl_state,
 
     return (int)(input - initial_input);
 }
+/* RFC 4492 / RFC 8422 Section 5.4:
+ *
+ * struct {
+ *     ECCurveType curve_type;      // 1 byte, typically named_curve (3)
+ *     select (curve_type) {
+ *         case named_curve:
+ *             NamedCurve namedcurve;   // 2 bytes
+ *     } curve;
+ * } ECParameters;
+ *
+ * struct {
+ *     opaque point<1..2^8-1>;      // 1-byte length prefix
+ * } ECPoint;
+ *
+ * struct {
+ *     ECParameters curve_params;
+ *     ECPoint      public;
+ * } ServerECDHParams;
+ *
+ * If is_signed, this is followed by (RFC 5246 Section 7.4.3):
+ *
+ * struct {
+ *     select (SignatureAlgorithm) {
+ *         case rsa: ...
+ *     };
+ *     digitally-signed struct {
+ *         opaque client_random[32];
+ *         opaque server_random[32];
+ *         ServerECDHParams params;
+ *     } signed_params;
+ * };
+ *
+ * TLS 1.2 prepends a 2-byte SignatureAndHashAlgorithm before the
+ * signature length+data; TLS 1.0/1.1 do not have that field.
+ */
+
+#define TLS_EC_CURVE_TYPE_NAMED_CURVE 3
+
+static int TlsDecodeSKEECDHParams(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len, bool is_signed)
+{
+    const uint8_t *input = initial_input;
+
+    /* --- ECParameters.curve_type --- */
+    if (!(HAS_SPACE(1))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading curve_type");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint8_t curve_type = *input;
+    input += 1;
+
+    if (curve_type != TLS_EC_CURVE_TYPE_NAMED_CURVE) {
+        /* explicit_prime / explicit_char2 curve types are deprecated
+         * (RFC 8422 Section 5.4) and their encoding differs entirely;
+         * we do not attempt to parse them. */
+        SCLogDebug("ServerKeyExchange (ECDH): unsupported curve_type %u", curve_type);
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HANDSHAKE_MESSAGE);
+        return -1;
+    }
+
+    /* --- ECParameters.namedcurve --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading namedcurve");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t namedcurve = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    /* This is the group the server actually selected for key exchange. */
+    connp->negotiated_group = namedcurve;
+    SCLogDebug("ServerKeyExchange (ECDH): negotiated_group = 0x%04x", namedcurve);
+
+    /* --- ECPoint.point (1-byte length prefix, NOT 2 bytes like DH) --- */
+    if (!(HAS_SPACE(1))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading point length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint8_t point_len = *input;
+    input += 1;
+
+    if (!(HAS_SPACE(point_len))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading point data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    /* We do not need to keep the raw public key point around for anything
+     * currently implemented, so just skip over it. */
+    input += point_len;
+
+    if (!is_signed) {
+        /* *_anon suites: no signature block follows. */
+        return (int)(input - initial_input);
+    }
+
+    /* --- digitally-signed signed_params --- */
+    if (connp->version >= TLS_VERSION_12) {
+        /* SignatureAndHashAlgorithm: 2 bytes, not further interpreted here. */
+        if (!(HAS_SPACE(2))) {
+            SCLogDebug("ServerKeyExchange (ECDH): invalid length reading "
+                       "SignatureAndHashAlgorithm");
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+            return -1;
+        }
+        input += 2;
+    }
+
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading signature length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t sig_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(sig_len))) {
+        SCLogDebug("ServerKeyExchange (ECDH): invalid length reading signature data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    /* Signature bytes themselves are not verified here - we only need to
+     * consume them correctly to keep the handshake state machine in sync. */
+    input += sig_len;
+
+    return (int)(input - initial_input);
+}
+
+/* RFC 5246 Section 7.4.3:
+ *
+ * struct {
+ *     opaque dh_p<1..2^16-1>;
+ *     opaque dh_g<1..2^16-1>;
+ *     opaque dh_Ys<1..2^16-1>;
+ * } ServerDHParams;
+ *
+ * Unlike ECPoint, every field here uses a 2-byte length prefix (not 1),
+ * matching the general TLS opaque<1..2^16-1> convention.
+ *
+ * If is_signed, this is followed by the same digitally-signed structure
+ * used in TlsDecodeSKEECDHParams() - see that function for the TLS1.2
+ * SignatureAndHashAlgorithm version split.
+ */
+static int TlsDecodeSKEDHParams(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len, bool is_signed)
+{
+    const uint8_t *input = initial_input;
+
+    /* --- dh_p --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_p length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t dh_p_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(dh_p_len))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_p data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    /* dh_p is the DH modulus. We are not currently storing it for
+     * anything (e.g. Logjam-style weak-parameter detection would need
+     * it), so just skip over it for now. */
+    input += dh_p_len;
+
+    /* --- dh_g --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_g length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t dh_g_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(dh_g_len))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_g data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    input += dh_g_len;
+
+    /* --- dh_Ys (server's DH public value) --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_Ys length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t dh_ys_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(dh_ys_len))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading dh_Ys data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    input += dh_ys_len;
+
+    if (!is_signed) {
+        /* DH_anon: no signature block follows. */
+        return (int)(input - initial_input);
+    }
+
+    /* --- digitally-signed signed_params (same shape as ECDH path) --- */
+    if (connp->version >= TLS_VERSION_12) {
+        if (!(HAS_SPACE(2))) {
+            SCLogDebug("ServerKeyExchange (DH): invalid length reading "
+                       "SignatureAndHashAlgorithm");
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+            return -1;
+        }
+        input += 2;
+    }
+
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading signature length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t sig_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(sig_len))) {
+        SCLogDebug("ServerKeyExchange (DH): invalid length reading signature data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    input += sig_len;
+
+    return (int)(input - initial_input);
+}
+/* RFC 4279 Section 2:
+ *
+ * struct {
+ *     select (KeyExchangeAlgorithm) {
+ *         case psk:
+ *             opaque psk_identity_hint<0..2^16-1>;
+ *     };
+ * } ServerKeyExchange;
+ *
+ * Used standalone for plain PSK / RSA_PSK (no DH/EC params follow, and
+ * neither carries a signature - PSK-based suites are authenticated by
+ * the shared secret itself, not by a certificate signature).
+ */
+static int TlsDecodeSKEPskHint(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len)
+{
+    const uint8_t *input = initial_input;
+
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (PSK): invalid length reading psk_identity_hint length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t hint_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(hint_len))) {
+        SCLogDebug("ServerKeyExchange (PSK): invalid length reading psk_identity_hint data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    /* Not currently stored anywhere - skip over it. hint_len == 0 is
+     * valid (RFC 4279 allows an empty/absent hint). */
+    input += hint_len;
+
+    return (int)(input - initial_input);
+}
+
+/* RFC 4279 Section 3 (DHE_PSK):
+ *
+ * struct {
+ *     opaque psk_identity_hint<0..2^16-1>;
+ *     ServerDHParams params;
+ * } ServerKeyExchange;
+ *
+ * No signature follows - authentication comes from the shared PSK, not
+ * a certificate, so this reuses TlsDecodeSKEDHParams() with is_signed=false.
+ */
+static int TlsDecodeSKEPskDH(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len)
+{
+    int hint_consumed = TlsDecodeSKEPskHint(ssl_state, connp, initial_input, input_len);
+    if (hint_consumed < 0)
+        return -1;
+
+    if ((uint32_t)hint_consumed > input_len) {
+        DEBUG_VALIDATE_BUG_ON((uint32_t)hint_consumed > input_len);
+        return -1;
+    }
+
+    int dh_consumed = TlsDecodeSKEDHParams(ssl_state, connp,
+            initial_input + hint_consumed, input_len - (uint32_t)hint_consumed, false);
+    if (dh_consumed < 0)
+        return -1;
+
+    return hint_consumed + dh_consumed;
+}
+
+/* RFC 5489 Section 2 (ECDHE_PSK):
+ *
+ * struct {
+ *     opaque psk_identity_hint<0..2^16-1>;
+ *     ServerECDHParams params;
+ * } ServerKeyExchange;
+ *
+ * No signature follows, same reasoning as DHE_PSK above.
+ */
+static int TlsDecodeSKEPskECDH(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len)
+{
+    int hint_consumed = TlsDecodeSKEPskHint(ssl_state, connp, initial_input, input_len);
+    if (hint_consumed < 0)
+        return -1;
+
+    if ((uint32_t)hint_consumed > input_len) {
+        DEBUG_VALIDATE_BUG_ON((uint32_t)hint_consumed > input_len);
+        return -1;
+    }
+
+    int ecdh_consumed = TlsDecodeSKEECDHParams(ssl_state, connp,
+            initial_input + hint_consumed, input_len - (uint32_t)hint_consumed, false);
+    if (ecdh_consumed < 0)
+        return -1;
+
+    return hint_consumed + ecdh_consumed;
+}
+
+/* RFC 4346 Section 7.4.3 (legacy RSA_EXPORT key exchange):
+ *
+ * struct {
+ *     opaque rsa_modulus<1..2^16-1>;
+ *     opaque rsa_exponent<1..2^16-1>;
+ * } ServerRSAParams;
+ *
+ * struct {
+ *     ServerRSAParams params;
+ *     digitally-signed struct {
+ *         opaque client_random[32];
+ *         opaque server_random[32];
+ *         ServerRSAParams params;
+ *     } signed_params;
+ * } ServerKeyExchange;
+ *
+ * RSA_EXPORT suites always carry a signature (there is no anonymous
+ * variant) - this is the temporary weak RSA key historically exploited
+ * by the FREAK downgrade attack. These suites predate TLS1.2, so in
+ * practice the SignatureAndHashAlgorithm version check below should
+ * never trigger, but it is kept for defensive consistency with the
+ * other SKE parsers.
+ */
+static int TlsDecodeSKERSAExportParams(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len)
+{
+    const uint8_t *input = initial_input;
+
+    /* --- rsa_modulus --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading rsa_modulus length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t modulus_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(modulus_len))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading rsa_modulus data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    /* Not currently stored - a FREAK-style weak-key detector would want
+     * to keep modulus_len around (e.g. flag anything < 512 bits) but
+     * that is not implemented here yet. */
+    input += modulus_len;
+
+    /* --- rsa_exponent --- */
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading rsa_exponent length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t exponent_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(exponent_len))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading rsa_exponent data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    input += exponent_len;
+
+    /* --- digitally-signed signed_params (always present for RSA_EXPORT) --- */
+    if (connp->version >= TLS_VERSION_12) {
+        if (!(HAS_SPACE(2))) {
+            SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading "
+                       "SignatureAndHashAlgorithm");
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+            return -1;
+        }
+        input += 2;
+    }
+
+    if (!(HAS_SPACE(2))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading signature length");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    uint16_t sig_len = (uint16_t)(*input << 8) | *(input + 1);
+    input += 2;
+
+    if (!(HAS_SPACE(sig_len))) {
+        SCLogDebug("ServerKeyExchange (RSA_EXPORT): invalid length reading signature data");
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+        return -1;
+    }
+
+    input += sig_len;
+
+    return (int)(input - initial_input);
+}
+
+static int TlsDecodeHSServerKeyExchange(SSLState *ssl_state, SSLStateConnp *connp,
+        const uint8_t *const initial_input, const uint32_t input_len)
+{
+    const SslCipherAudit *ca = &ssl_state->server_connp.cipher_audit;
+
+    /* server-side cipher_audit must be complete, well-formed, successfully
+     * allocated, and contain exactly one entry (the negotiated cipher
+     * suite) before we trust it to drive parsing. */
+    if (!ca->ready || !ca->framing_ok || ca->alloc_failed ||
+            ca->ciphers == NULL || ca->count != 1) {
+        SCLogDebug("server cipher_audit not usable (ready=%u framing_ok=%u "
+                   "alloc_failed=%u count=%u), cannot dispatch ServerKeyExchange",
+                ca->ready, ca->framing_ok, ca->alloc_failed, ca->count);
+        SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HANDSHAKE_MESSAGE);
+        return -1;
+    }
+
+    /* ciphers[] stores raw network-byte-order bytes, 2 bytes per entry;
+     * count == 1 here so entry 0 is the negotiated cipher suite. */
+    uint16_t cipher_id = (uint16_t)(ca->ciphers[0] << 8) | ca->ciphers[1];
+
+    SkePresence presence = TlsCipherModeGetSkePresence(cipher_id);
+
+    switch (presence) {
+        case SKE_DH_SIGNED:
+            return TlsDecodeSKEDHParams(ssl_state, connp, initial_input, input_len, true);
+        case SKE_DH_UNSIGNED:
+            return TlsDecodeSKEDHParams(ssl_state, connp, initial_input, input_len, false);
+
+        case SKE_ECDH_SIGNED:
+            return TlsDecodeSKEECDHParams(ssl_state, connp, initial_input, input_len, true);
+        case SKE_ECDH_UNSIGNED:
+            return TlsDecodeSKEECDHParams(ssl_state, connp, initial_input, input_len, false);
+
+        case SKE_RSA_EXPORT:
+            return TlsDecodeSKERSAExportParams(ssl_state, connp, initial_input, input_len);
+
+        case SKE_PSK_HINT_ONLY:
+            return TlsDecodeSKEPskHint(ssl_state, connp, initial_input, input_len);
+        case SKE_PSK_DH:
+            return TlsDecodeSKEPskDH(ssl_state, connp, initial_input, input_len);
+        case SKE_PSK_ECDH:
+            return TlsDecodeSKEPskECDH(ssl_state, connp, initial_input, input_len);
+
+        case SKE_SRP_SIGNED:
+        case SKE_SRP_UNSIGNED:
+        case SKE_UNKNOWN:
+            /* Structure not implemented / not confirmed - do not attempt
+             * to parse, just report an event. */
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HANDSHAKE_MESSAGE);
+            return -1;
+
+        case SKE_ABSENT:
+        default:
+            /* This cipher suite should not have produced a
+             * ServerKeyExchange message at all. */
+            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_HANDSHAKE_MESSAGE);
+            return -1;
+    }
+}
+
+static inline int TLSDecodeHSHelloExtensionKeyShare(SSLState *ssl_state,
+                                          const uint8_t * const initial_input,
+                                          const uint32_t input_len)
+{
+    const uint8_t *input = initial_input;
+
+    /* Empty extension */
+    if (input_len == 0)
+        return 0;
+
+    /* Client side: we don't currently extract anything from the list of
+     * candidate KeyShareEntry values, so just let it be skipped like any
+     * other extension we don't parse - no need to open up the inner
+     * structure. */
+    if (ssl_state->current_flags & SSL_AL_FLAG_STATE_CLIENT_HELLO) {
+        return (int)input_len;
+    }
+
+    if (ssl_state->current_flags & SSL_AL_FLAG_STATE_SERVER_HELLO) {
+
+        if (!(HAS_SPACE(2)))
+            goto invalid_length;
+
+        uint16_t group = (uint16_t)(*input << 8) | *(input + 1);
+        input += 2;
+
+        /* HelloRetryRequest form: only the group field is present,
+         * no key_exchange follows. */
+        if (input_len == 2) {
+            ssl_state->curr_connp->negotiated_group = group;
+            SCLogDebug("key_share (HelloRetryRequest): negotiated_group = 0x%04x", group);
+            return (int)(input - initial_input);
+        }
+
+        if (!(HAS_SPACE(2)))
+            goto invalid_length;
+
+        uint16_t ke_len = (uint16_t)(*input << 8) | *(input + 1);
+        input += 2;
+
+        if (!(HAS_SPACE(ke_len)))
+            goto invalid_length;
+
+        input += ke_len;
+
+        ssl_state->curr_connp->negotiated_group = group;
+        SCLogDebug("key_share (ServerHello): negotiated_group = 0x%04x", group);
+    }
+
+    return (int)(input - initial_input);
+
+invalid_length:
+    SCLogDebug("TLS handshake invalid length (key_share)");
+    SSLSetEvent(ssl_state,
+                TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH);
+
+    return -1;
+}
 
 static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
                                          const uint8_t * const initial_input,
@@ -1538,13 +2127,15 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
         ssl_state->curr_connp->ext_audit.alloc_failed,
         ssl_state->curr_connp->ext_audit.count,
         ssl_state->curr_connp->ext_audit.max_fragment_length);
-
+    
+    #ifdef DEBUG
     for (uint16_t i = 0; i < ssl_state->curr_connp->ext_audit.count; i++) {
-        SCLogDebug("  ext[%u]=0x%04x (%u)", i,
-        ssl_state->curr_connp->ext_audit.types[i],
-        ssl_state->curr_connp->ext_audit.types[i]);
+        uint16_t ext = ssl_state->curr_connp->ext_audit.types[i];
+        const char *name = TlsExtensionGetName(ext);
+        SCLogDebug("  ext[%u]=0x%04x (%s)", i, ext, name ? name : "unknown");
     }
-
+    #endif
+    
     const uint8_t *input = initial_input;
     int ret;
     int rc;
@@ -1713,13 +2304,23 @@ static inline int TLSDecodeHSHelloExtensions(SSLState *ssl_state,
 
                 break;
             }
+            case SSL_EXTENSION_KEY_SHARE:
+            {
+                ret = TLSDecodeHSHelloExtensionKeyShare(ssl_state, input, ext_len);
+                if (ret < 0)
+                goto end;
+
+                input += ret;
+
+                break;
+        }
             default:
             {
                 input += ext_len;
                 break;
             }
         }
-
+        
         if (ja3) {
             if (TLSDecodeValueIsGREASE(ext_type) != 1) {
                 rc = Ja3BufferAddValue(&ja3_extensions, ext_type);
@@ -1937,6 +2538,14 @@ static int SSLv3ParseHandshakeType(SSLState *ssl_state, const uint8_t *input,
 
         case SSLV3_HS_SERVER_KEY_EXCHANGE:
             ssl_state->current_flags = SSL_AL_FLAG_STATE_SERVER_KEYX;
+            rc = TlsDecodeHSServerKeyExchange(ssl_state, &ssl_state->server_connp, input, input_len);
+                if (rc < 0) {
+                /* TlsDecodeHSServerKeyExchange() already raised the appropriate
+                * event before returning - just propagate the failure up so the
+                * caller resets handshake state the same way it does for the
+                * other error paths in this switch. */
+                return rc;
+            }
             break;
 
         case SSLV3_HS_CLIENT_KEY_EXCHANGE:
@@ -3214,7 +3823,10 @@ static void SSLStateFree(void *p)
 
     TLSCipherAuditFree(&ssl_state->client_connp.cipher_audit);
     TLSCipherAuditFree(&ssl_state->server_connp.cipher_audit);
-
+    
+    TLSSupportedGroupsAuditFree(&ssl_state->client_connp.supported_groups_audit);
+    TLSSupportedGroupsAuditFree(&ssl_state->server_connp.supported_groups_audit);
+    
     SSLStateCertSANFree(&ssl_state->server_connp);
     SSLStateCertSANFree(&ssl_state->client_connp);
 

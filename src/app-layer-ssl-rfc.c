@@ -648,7 +648,7 @@ int TLSCipherAuditServerIsRC4(const SslCipherAudit *server_audit)
 
     uint16_t selected = (uint16_t)((server_audit->ciphers[0] << 8) | server_audit->ciphers[1]);
 
-    if (TLSCipherSuiteIsRC4(selected)) {
+    if (TlsCipherModeIsStream(selected)) {
         return 0;
     }
     return 1;
@@ -678,7 +678,7 @@ int TLSCipherAuditClientProposedRC4(const SslCipherAudit *client_audit)
     for (uint16_t i = 0; i < client_audit->count; i++) {
         uint16_t c = (uint16_t)((client_audit->ciphers[i * 2] << 8) |
                                  client_audit->ciphers[i * 2 + 1]);
-        if (TLSCipherSuiteIsRC4(c)) {
+        if (TlsCipherModeIsStream(c)) {
             return 0;
         }
     }
@@ -713,7 +713,7 @@ int TLSCipherAuditClientOnlyRC4(const SslCipherAudit *client_audit)
     for (uint16_t i = 0; i < client_audit->count; i++) {
         uint16_t c = (uint16_t)((client_audit->ciphers[i * 2] << 8) |
                                  client_audit->ciphers[i * 2 + 1]);
-        if (!TLSCipherSuiteIsRC4(c)) {
+        if (!TlsCipherModeIsStream(c)) {
             return 1;
         }
     }
@@ -784,7 +784,7 @@ int TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
     uint16_t selected = (uint16_t)((server_cipher_audit->ciphers[0] << 8) |
                                     server_cipher_audit->ciphers[1]);
 
-    TlsCipherMode mode = TLSCipherSuiteGetMode(selected);
+    TlsCipherMode mode = TlsCipherModeGet(selected);
 
     if (mode == TLS_CIPHER_MODE_UNKNOWN) {
         return 1;
@@ -801,46 +801,144 @@ int TLSExtAuditServerEncryptThenMacRequiresBlockCipher(
     return 1;
 }
 
+int TLSCipherAuditServerIsDeprecated(const SslCipherAudit *server_audit)
+{
+    if (server_audit == NULL) {
+        return 1;
+    }
+    if (!server_audit->ready || !server_audit->framing_ok || server_audit->alloc_failed) {
+        return 1;
+    }
+    if (server_audit->count == 0) {
+        return 1;
+    }
 
+    uint16_t selected = (uint16_t)((server_audit->ciphers[0] << 8) | server_audit->ciphers[1]);
 
-void TLSExtractDHClientKeyExchange(const uint8_t *buf, uint32_t input_len, SslDhPublicAudit *out)
+    TlsRecommended rec = TlsCipherModeGetRecommended(selected);
+    if (rec == TLS_RECOMMENDED_NO || rec == TLS_RECOMMENDED_DISCOURAGED) {
+        return 0;
+    }
+    return 1;
+}
+
+/**
+ * \internal
+ * \brief Parse the elliptic_curves / supported_groups extension body into
+ *        an SslSupportedGroups struct.
+ *
+ * Mirrors the two-pass style of TLSExtractHSHelloExtTypes(): first pass only
+ * validates framing and counts entries that will actually be stored (GREASE
+ * values are skipped and not counted); only once framing is fully validated
+ * is memory allocated, then a second pass fills the array, converting each
+ * value to host byte order and filtering out GREASE.
+ *
+ * \retval true  framing is well-formed (out->groups may still be NULL if
+ *               the extension was empty or every entry was GREASE)
+ * \retval false malformed framing - caller should raise
+ *               TLS_DECODER_EVENT_HANDSHAKE_INVALID_LENGTH
+ */
+void TLSExtractHSHelloSupportedGroups(
+        const uint8_t *buf, uint32_t len, SslSupportedGroups *out)
 {
     memset(out, 0, sizeof(*out));
 
-    const uint8_t *initial_input = buf;
-    const uint8_t *input = buf;
-
-    if ((uint64_t)(input - initial_input) + (uint64_t)2 > (uint64_t)input_len) {
-        out->framing_ok = false;
-        out->ready = true;
-        return;
-    }
-
-    uint16_t share_len = (uint16_t)((input[0] << 8) | input[1]);
-    input += 2;
-
-    if (share_len == 0) {
-        out->framing_ok = false;
-        out->ready = true;
-        return;
-    }
-
-    if ((uint64_t)(input - initial_input) + (uint64_t)share_len > (uint64_t)input_len) {
-        out->framing_ok = false;
-        out->ready = true;
-        return;
-    }
-
-    out->share = SCMalloc(share_len);
-    if (out->share == NULL) {
-        out->alloc_failed = true;
+    if (len == 0) {
         out->framing_ok = true;
         out->ready = true;
         return;
     }
 
-    memcpy(out->share, input, share_len);
-    out->share_len = share_len;
+    uint32_t offset = 0;
+
+    if (len - offset < 2) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    uint16_t groups_total = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);
+    offset += 2;
+
+    if (len - offset < groups_total) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    /* length must be a multiple of 2 */
+    if ((groups_total % 2) != 0) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    const uint32_t block_end = offset + groups_total;
+
+    /* Pass 1: validate framing and count non-GREASE entries. No writes yet. */
+    uint32_t scan_offset = offset;
+    uint16_t keep_count = 0;
+    while (scan_offset < block_end) {
+        if (block_end - scan_offset < 2) {
+            out->framing_ok = false;
+            out->ready = true;
+            return;
+        }
+        uint16_t group = (uint16_t)((buf[scan_offset] << 8) | buf[scan_offset + 1]);
+        scan_offset += 2;
+
+        if (TLS_EXT_IS_GREASE(group) != 1) {
+            keep_count++;
+        }
+    }
+    
+    if (scan_offset != block_end) {
+        out->framing_ok = false;
+        out->ready = true;
+        return;
+    }
+
+    /* Framing is fully validated. Allocate exact-size storage. */
+    if (keep_count > 0) {
+        out->groups = SCMalloc(keep_count * 2);
+        if (out->groups == NULL) {
+            out->alloc_failed = true; /* OOM: treat as unreliable, same as before */
+            out->framing_ok = true;
+            out->ready = true;
+            return;
+        }
+    }
+
+    /* Pass 2: copy the raw 2-byte entries as-is (network byte order),
+     * skipping GREASE. Framing already validated above, so no bounds
+     * re-checking needed here. */
+    uint32_t fill_offset = offset;
+    uint16_t idx = 0;
+    while (fill_offset < block_end) {
+        uint16_t group = (uint16_t)((buf[fill_offset] << 8) | buf[fill_offset + 1]);
+
+        if (TLS_EXT_IS_GREASE(group) != 1) {
+            out->groups[idx * 2] = buf[fill_offset];
+            out->groups[idx * 2 + 1] = buf[fill_offset + 1];
+            idx++;
+        }
+
+        fill_offset += 2;
+    }
+
+    out->count = keep_count;
     out->framing_ok = true;
     out->ready = true;
+}
+
+void TLSSupportedGroupsAuditFree(SslSupportedGroups *audit)
+{
+    if (audit->groups != NULL) {
+        SCFree(audit->groups);
+        audit->groups = NULL;
+    }
+    audit->count = 0;
+    audit->ready = false;
+    audit->framing_ok = false;
+    audit->alloc_failed = false;
 }

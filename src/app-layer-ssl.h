@@ -95,6 +95,7 @@ enum {
     TLS_DECODER_EVENT_SERVER_SNI_LENGTH_NOT_ZERO,
     TLS_DECODER_EVENT_SNI_IN_RESUMED_SESSION,
     TLS_DECODER_EVENT_INVALID_HOSTNAME_FORMAT,
+    TLS_DECODER_EVENT_SERVER_DEPRECATED_CIPHER_SUITE,
 };
 
 enum TlsStateClient {
@@ -176,6 +177,7 @@ enum TlsStateServer {
 #define SSL_EXTENSION_EARLY_DATA                0x002a
 #define SSL_EXTENSION_SUPPORTED_VERSIONS        0x002b
 #define SSL_EXTENSION_PADDING                   0x0015
+#define SSL_EXTENSION_KEY_SHARE                 0x0033
 
 /* SNI types */
 #define SSL_SNI_TYPE_HOST_NAME                  0
@@ -245,6 +247,8 @@ typedef struct SSLStateConnp_ {
     HandshakeParams *hs;
     SslExtAudit ext_audit;
     SslCipherAudit cipher_audit;
+    SslSupportedGroups supported_groups_audit;
+    uint16_t negotiated_group;
     /* handshake tls fragmentation buffer. Handshake messages can be fragmented over multiple
      * TLS records. */
     uint8_t *hs_buffer;

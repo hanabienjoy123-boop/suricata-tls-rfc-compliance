@@ -194,8 +194,7 @@ alert tls any any -> any any (msg:"TLS server negotiated SSLv2 SERVER-HELLO - RF
     reference:url,datatracker.ietf.org/doc/html/rfc6176#section-3; \
     sid:1000021; rev:1;)
 
-
-    # ===== SSLv2-format ClientHello detection (RFC 6176 §3, client-side ban) =====
+# ===== SSLv2-format ClientHello detection (RFC 6176 §3, client-side ban) =====
 # client sent a ClientHello using the SSLv2 record format - either the
 # 2-byte header (no padding) or 3-byte header (padding) variant - which
 # RFC 6176 §3 prohibits regardless of the version number declared inside
@@ -234,3 +233,12 @@ alert tcp any any -> any any (msg:"ssl2 hello check done - no match"; \
     flowbits:set,ssl2.hello.checked; \
     noalert; \
     sid:1000024; rev:1;)
+
+# --- detect: server selected a cipher suite that IANA marks as
+# "Not Recommended" or "Discouraged" (D) in the TLS Cipher Suites
+
+alert tls any any -> any any (msg:"SURICATA TLS deprecated cipher suite negotiated by server"; \
+    flow:established,to_client; \
+    app-layer-event:tls.server_deprecated_cipher_suite; \
+    classtype:protocol-command-decode; \
+    sid:1000025; rev:1;)

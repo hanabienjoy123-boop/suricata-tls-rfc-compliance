@@ -8,84 +8,88 @@
 #ifndef SURICATA_TLS_CIPHER_SUITE_MODE_H
 #define SURICATA_TLS_CIPHER_SUITE_MODE_H
 
-/**
- * \brief Cipher-mode classification used to determine whether a cipher
- *        suite is a standard block cipher with distinct encrypt/MAC
- *        operations (RFC 7366 Section 3), or a stream/AEAD/NULL cipher
- *        for which the encrypt_then_mac extension has no meaning.
- */
 typedef enum {
-    TLS_CIPHER_MODE_UNKNOWN = 0, /**< not found in the classification table;
-                                   *   treat as unreliable */
-    TLS_CIPHER_MODE_BLOCK,       /**< CBC-mode block cipher; encrypt_then_mac
-                                   *   (RFC 7366) applies */
-    TLS_CIPHER_MODE_STREAM,      /**< e.g. RC4; encrypt_then_mac does not
-                                   *   apply */
-    TLS_CIPHER_MODE_AEAD,        /**< GCM/CCM/ChaCha20-Poly1305/etc; already
-                                   *   authenticated, encrypt_then_mac does
-                                   *   not apply */
-    TLS_CIPHER_MODE_NULL,        /**< no encryption (or integrity-only);
-                                   *   encrypt_then_mac does not apply */
+    TLS_CIPHER_MODE_NULL,     /* no encryption (WITH_NULL_*) */
+    TLS_CIPHER_MODE_STREAM,   /* stream cipher (e.g. RC4) */
+    TLS_CIPHER_MODE_BLOCK,    /* block cipher, CBC mode (e.g. AES-CBC, 3DES, DES) */
+    TLS_CIPHER_MODE_AEAD,     /* AEAD mode (e.g. GCM, CCM, ChaCha20-Poly1305) */
+    TLS_CIPHER_MODE_UNKNOWN,  /* could not be determined from the name */
 } TlsCipherMode;
 
-/**
- * \brief Classification of the ClientKeyExchange wire-format structure a
- *        cipher suite implies. This is orthogonal to TlsCipherMode (which
- *        classifies bulk encryption): a cipher suite's KeyExchangeAlgorithm
- *        determines what ClientKeyExchange.exchange_keys actually contains,
- *        independent of whether the record cipher itself is BLOCK/STREAM/AEAD.
- */
 typedef enum {
-    TLS_KEX_STRUCT_UNKNOWN = 0,   /**< not classifiable from the name alone
-                                    *   (GOST suites, legacy pseudo-suites
-                                    *   like TLS_SHA256_SHA256); treat as
-                                    *   unreliable, do not parse */
-    TLS_KEX_STRUCT_NONE,          /**< TLS 1.3 AEAD suites: no legacy
-                                    *   ClientKeyExchange message exists at
-                                    *   all; key exchange is negotiated via
-                                    *   the key_share extension instead */
-    TLS_KEX_STRUCT_RSA,           /**< EncryptedPreMasterSecret (opaque
-                                    *   RSA-encrypted blob) */
-    TLS_KEX_STRUCT_DH,            /**< ClientDiffieHellmanPublic (dh_Yc);
-                                    *   covers both static (dh_dss/dh_rsa)
-                                    *   and ephemeral (dhe_dss/dhe_rsa/
-                                    *   dh_anon) -- same wire structure */
-    TLS_KEX_STRUCT_ECDH,          /**< ClientECDiffieHellmanPublic
-                                    *   (ecdh_Yc); covers both static
-                                    *   (ecdh_ecdsa/ecdh_rsa) and ephemeral
-                                    *   (ecdhe_ecdsa/ecdhe_rsa/ecdh_anon) */
-    TLS_KEX_STRUCT_PSK,           /**< psk_identity only, no DH/ECDH/RSA
-                                    *   component */
-    TLS_KEX_STRUCT_DHE_PSK,       /**< psk_identity + ClientDiffieHellmanPublic */
-    TLS_KEX_STRUCT_RSA_PSK,       /**< psk_identity + EncryptedPreMasterSecret */
-    TLS_KEX_STRUCT_ECDHE_PSK,     /**< psk_identity + ClientECDiffieHellmanPublic */
-    TLS_KEX_STRUCT_SRP,           /**< srp_A (RFC 5054); structurally
-                                    *   resembles DH but is a distinct
-                                    *   mechanism */
-    TLS_KEX_STRUCT_KRB5,          /**< Kerberos ticket-based exchange
-                                    *   (RFC 2712); entirely different
-                                    *   structure, not DH/RSA-derived */
-    TLS_KEX_STRUCT_PWD,           /**< RFC 8492 (ECCPWD/TLS-PWD); PAKE
-                                    *   scalar+element structure, distinct
-                                    *   from plain ECDH despite the "EC"
-                                    *   in the name */
-} TlsKeyExchangeStruct;
+    TLS_KEX_STRUCT_NONE,       /* no key exchange struct (NULL suite, or
+                                 * TLS1.3 suite where kex is via key_share) */
+    TLS_KEX_STRUCT_RSA,        /* static RSA / RSA_EXPORT */
+    TLS_KEX_STRUCT_DH,         /* DH_DSS / DH_RSA / DHE_DSS / DHE_RSA / DH_anon */
+    TLS_KEX_STRUCT_ECDH,       /* ECDH_ECDSA / ECDH_RSA / ECDHE_ECDSA / ECDHE_RSA / ECDH_anon */
+    TLS_KEX_STRUCT_PSK,        /* plain PSK */
+    TLS_KEX_STRUCT_DHE_PSK,
+    TLS_KEX_STRUCT_ECDHE_PSK,
+    TLS_KEX_STRUCT_RSA_PSK,
+    TLS_KEX_STRUCT_SRP,        /* SRP_SHA / SRP_SHA_RSA / SRP_SHA_DSS */
+    TLS_KEX_STRUCT_PWD,        /* TLS-PWD / ECCPWD (Dragonfly) */
+    TLS_KEX_STRUCT_KRB5,       /* Kerberos */
+    TLS_KEX_STRUCT_UNKNOWN,    /* GOST / non-standard, structure not verified */
+} TlsKexStruct;
 
-/**
- * \brief Look up the cipher-mode classification for a given cipher suite
- *        value, per the IANA TLS Cipher Suites registry.
- *
- * \param cipher_suite the 2-byte cipher suite value
- *
- * \return the classification, or TLS_CIPHER_MODE_UNKNOWN if the value is
- *         not present in the table
- */
-TlsCipherMode TLSCipherSuiteGetMode(uint16_t cipher_suite);
-const char *TLSCipherSuiteGetName(uint16_t cipher_suite);
-TlsKeyExchangeStruct TLSCipherSuiteGetKexStruct(uint16_t cipher_suite);
+typedef enum {
+    SKE_ABSENT,           /* cipher suite does not send ServerKeyExchange
+                            * (key material is in the certificate, or this
+                            * is a TLS1.3 suite where key exchange happens
+                            * via the key_share extension instead) */
+    SKE_DH_SIGNED,         /* ServerDHParams + digitally-signed block
+                            * (DHE_DSS / DHE_RSA) */
+    SKE_DH_UNSIGNED,       /* ServerDHParams, no signature (DH_anon) */
+    SKE_ECDH_SIGNED,       /* ServerECDHParams + digitally-signed block
+                            * (ECDHE_RSA / ECDHE_ECDSA) */
+    SKE_ECDH_UNSIGNED,     /* ServerECDHParams, no signature (ECDH_anon) */
+    SKE_RSA_EXPORT,        /* legacy weak RSA export key + signature
+                            * (RSA_EXPORT family, relevant to FREAK) */
+    SKE_PSK_HINT_ONLY,     /* only psk_identity_hint, no DH/EC params
+                            * (PSK / RSA_PSK) */
+    SKE_PSK_DH,            /* psk_identity_hint + ServerDHParams, no
+                            * signature (DHE_PSK) */
+    SKE_PSK_ECDH,          /* psk_identity_hint + ServerECDHParams, no
+                            * signature (ECDHE_PSK) */
+    SKE_SRP_SIGNED,        /* ServerSRPParams + signature
+                            * (SRP_SHA_RSA / SRP_SHA_DSS) */
+    SKE_SRP_UNSIGNED,      /* ServerSRPParams, no signature (SRP_SHA anon) */
+    SKE_UNKNOWN,           /* GOST / non-standard suite, structure not
+                            * verified - do not attempt to parse, report
+                            * an event instead if encountered */
+} SkePresence;
 
-static inline bool TLSCipherSuiteIsRC4(uint16_t cipher_suite)
-{
-    return TLSCipherSuiteGetMode(cipher_suite) == TLS_CIPHER_MODE_STREAM;
-}
+typedef enum {
+    TLS_DTLS_OK_UNSPEC,
+    TLS_DTLS_OK_YES,
+    TLS_DTLS_OK_NO,
+} TlsDtlsOk;
+
+typedef enum {
+    TLS_RECOMMENDED_UNSPEC,
+    TLS_RECOMMENDED_YES,
+    TLS_RECOMMENDED_NO,
+    TLS_RECOMMENDED_DISCOURAGED,   /* IANA "D" - weaker than N, but flagged */
+} TlsRecommended;
+
+typedef struct TlsCipherModeEntry_ {
+    uint16_t         id;
+    TlsCipherMode     mode;
+    TlsKexStruct      kex_struct;
+    SkePresence       ske_presence;
+    TlsDtlsOk         dtls_ok;
+    TlsRecommended    recommended;
+    const char       *reference;
+    const char       *name;
+} TlsCipherModeEntry;
+
+TlsCipherMode  TlsCipherModeGet(uint16_t cipher_id);
+TlsKexStruct   TlsCipherModeGetKexStruct(uint16_t cipher_id);
+SkePresence    TlsCipherModeGetSkePresence(uint16_t cipher_id);
+TlsDtlsOk      TlsCipherModeGetDtlsOk(uint16_t cipher_id);
+TlsRecommended TlsCipherModeGetRecommended(uint16_t cipher_id);
+const char    *TlsCipherModeGetReference(uint16_t cipher_id);
+const char    *TlsCipherModeGetName(uint16_t cipher_id);
+bool TlsCipherModeIsStream(uint16_t cipher_id);
+
 #endif /* SURICATA_TLS_CIPHER_SUITE_MODE_H */
